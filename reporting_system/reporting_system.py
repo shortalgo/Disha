@@ -8,6 +8,8 @@ End-to-end: DIM sync (from algo_department.core) + Slippage/PnL ETL + Error flag
 - Runs trade ETL with IST-safe date parsing
 - Adds helpful views + indexes for Metabase
 - Handles cross-day realization via carry-in positions from prior EOD
+- FIX: carry-in rows now get a synthetic unique_id so inserts into mart.trades_all never violate NOT NULL/PK
+- FIX: PnL dedup both in pandas and SQL to avoid PK collisions in mart.trade_pnl
 
 Run examples:
   python reporting_system.py --from 2025-10-03 --to 2025-10-03
@@ -425,15 +427,9 @@ CREATE INDEX IF NOT EXISTS ix_err_day          ON ops.erroneous_trades(trade_day
 
 # ================== Migration helper (drop trade_number; dedup PnL) ==================
 def migrate_drop_trade_number(dst_engine):
-    """
-    Makes live DB match the new shapes by removing legacy trade_number columns,
-    de-duplicating old PnL rows, and resetting PKs. Drops our views first to avoid dependency errors.
-    """
     with dst_engine.begin() as con:
-        # 0) Drop views first (safe if they didn't exist)
         con.execute(text(DDL_MART_OPS_VIEWS_DROP))
 
-        # Helpers
         def col_exists(schema, table, column):
             q = text("""
                 SELECT 1
@@ -458,7 +454,6 @@ def migrate_drop_trade_number(dst_engine):
             drop_all_pks("mart", "trade_pnl")
             con.execute(text("ALTER TABLE mart.trade_pnl DROP COLUMN IF EXISTS trade_number"))
 
-        # If duplicates exist on the new PK keys, collapse them (sum PnL & fills; take any for text dims)
         con.execute(text("""
             CREATE TEMP TABLE IF NOT EXISTS _tmp_pnl_dedup AS
             SELECT
@@ -486,7 +481,7 @@ def migrate_drop_trade_number(dst_engine):
             ADD PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
         """))
 
-        # 2) ops.erroneous_trades: drop legacy column, ensure PK
+        # 2) ops tables: remove legacy trade_number if present
         if col_exists("ops", "erroneous_trades", "trade_number"):
             drop_all_pks("ops", "erroneous_trades")
             con.execute(text("ALTER TABLE ops.erroneous_trades DROP COLUMN IF EXISTS trade_number"))
@@ -495,7 +490,6 @@ def migrate_drop_trade_number(dst_engine):
                 ADD PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, issue_code, first_ts)
             """))
 
-        # 3) ops.erroneous_trades_clean: drop legacy column, ensure PK
         if col_exists("ops", "erroneous_trades_clean", "trade_number"):
             drop_all_pks("ops", "erroneous_trades_clean")
             con.execute(text("ALTER TABLE ops.erroneous_trades_clean DROP COLUMN IF EXISTS trade_number"))
@@ -514,14 +508,10 @@ def ensure_dim_schema(dst_engine):
 def ensure_mart_ops_schema(dst_engine):
     if MANAGE_SCHEMA_EXTERNALLY:
         return
-    # 0) One-time migration to remove legacy trade_number & fix PKs/dedup
     migrate_drop_trade_number(dst_engine)
     with dst_engine.begin() as con:
-        # 1) Ensure tables exist (final shapes)
         con.execute(text(DDL_MART_OPS_TABLES))
-        # 2) Indexes
         con.execute(text(DDL_INDEXES_PERF))
-        # 3) Recreate views after tables exist
         con.execute(text(DDL_MART_OPS_VIEWS_CREATE))
 
 # ------------------ Helpers to fetch source DFs robustly ------------------
@@ -682,10 +672,9 @@ def fetch_carry_in_positions(dst_engine, from_date):
     if df_prev.empty:
         return df_prev
 
-    # Synthetic "carry-in" fills
     start_ts = pd.Timestamp(f"{from_date} 00:00:00").tz_localize(IST_TZ)
     carry = pd.DataFrame({
-        "unique_id": None,  # not required downstream for PnL/open
+        "unique_id": None,  # will be set below
         "instrument_name": None,
         "type": None,
         "option_type": None,
@@ -699,7 +688,7 @@ def fetch_carry_in_positions(dst_engine, from_date):
         "user_id": df_prev["user_id"].astype(str),
         "strategy_variant_id": df_prev["strategy_variant_id"].astype(str),
         "strike": df_prev["strike"].astype(float),
-        "qty": df_prev["net_qty"].astype(float),                # signed quantity
+        "qty": df_prev["net_qty"].astype(float),
         "trade_price": df_prev["avg_entry_price"].astype(float),
         "side": np.where(df_prev["net_qty"] > 0, "BUY",
                          np.where(df_prev["net_qty"] < 0, "SELL", None)),
@@ -709,6 +698,19 @@ def fetch_carry_in_positions(dst_engine, from_date):
         "strategy_name": df_prev["strategy_name"],
         "portfolio_name": df_prev["portfolio_name"],
     })
+
+    def _strike_text(val: float) -> str:
+        if pd.isna(val):
+            return "NA"
+        i = int(val)
+        return str(i) if abs(val - i) < 1e-9 else str(val)
+
+    carry["unique_id"] = carry.apply(
+        lambda r: f"CIN:{r['trade_day']}:{str(r['account_id'])}:{str(r['strategy_id'])}:{str(r['user_id'])}:{str(r['strategy_variant_id'])}:{_strike_text(float(r['strike']))}",
+        axis=1,
+    )
+    carry["instrument_name"] = carry["instrument_name"].fillna("CARRY_IN")
+    carry["type"] = carry["type"].fillna("CARRY_IN")
     return carry
 
 # ================== Trade ETL ==================
@@ -749,7 +751,6 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
     with src_engine.connect() as con:
         df = pd.read_sql(q, con, params={"d1": from_date, "d2": to_date})
 
-    # Normalize / enrich base slice
     if df.empty:
         print(f"No trades found {from_date}..{to_date}")
         return
@@ -764,24 +765,22 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
     df["side"]          = np.where(sign > 0, "BUY", np.where(sign < 0, "SELL", None))
     df["entry_exit"]    = df["entry_exit_error"].astype(str).str.strip().str.title()
 
-    # ---------- CARRY-IN from previous EOD (critical for cross-day realization) ----------
+    # ---------- CARRY-IN from previous EOD ----------
     carry = fetch_carry_in_positions(dst_engine, from_date)
     if carry is not None and not carry.empty:
-        # align columns that exist in df, fill missing
         for col in df.columns:
             if col not in carry.columns:
                 carry[col] = None
         for col in carry.columns:
             if col not in df.columns:
                 df[col] = None
-        # Columns order union
         cols_union = list(df.columns)
-        # Concatenate carry rows before same-day fills
-        df = pd.concat([carry[cols_union], df[cols_union]], ignore_index=True)
+        carry = carry.reindex(columns=cols_union)
+        df = pd.concat([carry, df[cols_union]], ignore_index=True)
 
     # ---------- Slippage per fill ----------
     theo_ok = df["theoretical_price"].notna() & (df["theoretical_price"] > 0)
-    sign    = np.sign(df["qty"].astype(float))  # re-evaluate after carry concat
+    sign    = np.sign(df["qty"].astype(float))
     df["slip_abs"] = np.where(theo_ok, (df["trade_price"] - df["theoretical_price"]) * sign, np.nan)
     df["slip_pct"] = np.where(theo_ok, 100.0 * df["slip_abs"] / df["theoretical_price"], np.nan)
 
@@ -793,11 +792,12 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                 "strategy_variant_id","instrument_name","type","option_type","strike","qty",
                 "trade_price","side","entry_label","theoretical_price","exec_mode",
                 "account_name","strategy_name","portfolio_name"]
-        # ensure cols present
         for c in cols:
             if c not in df_raw.columns:
                 df_raw[c] = None
-        df_raw[cols].to_sql("_trades_all_stage", con, schema="mart", if_exists="replace", index=False)
+        df_raw = df_raw[cols]
+        df_raw = df_raw[df_raw["unique_id"].notna()]  # safety
+        df_raw.to_sql("_trades_all_stage", con, schema="mart", if_exists="replace", index=False)
         con.execute(text("""
             INSERT INTO mart.trades_all
             (unique_id, timestamp_ist, trade_day, account_id, strategy_id, user_id,
@@ -824,7 +824,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
             DROP TABLE mart._trades_all_stage;
         """))
 
-    # ---------- CLUBBING (VWAP) at identical timestamp/instrument bucket ----------
+    # ---------- CLUBBING (VWAP) ----------
     club_keys = [
         "timestamp_ist","trade_day",
         "account_id","strategy_id","user_id","strategy_variant_id",
@@ -869,20 +869,18 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
 
     errs_out = pd.DataFrame(err_rows)
 
-    # ---------- PnL & Open positions (use clubbed df_agg) ----------
+    # ---------- PnL & Open positions ----------
     pnl_keys = ["trade_day","account_id","strategy_id","user_id",
                 "strategy_variant_id","strike",
                 "account_name","strategy_name","portfolio_name","exec_mode"]
 
-    results = []
-    openpos = []
+    results, openpos = [], []
     for keys, sub in df_agg.groupby(pnl_keys, dropna=False):
         (trade_day, account_id, strategy_id, user_id,
          variant_id, strike,
          account_name, strategy_name, portfolio_name, exec_mode) = keys
 
         realized, fills, net_qty, avg_entry, _ = fifo_realized_pnl(sub)
-
         results.append({
             "trade_day": trade_day,
             "account_id": account_id, "strategy_id": strategy_id, "user_id": user_id,
@@ -907,6 +905,19 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
     pnl_out  = pd.DataFrame(results)
     open_out = pd.DataFrame(openpos)
 
+    # ---- GUARDRAIL: ensure one row per PnL PK in pandas before staging ----
+    if not pnl_out.empty:
+        _pnl_keys = ["trade_day","account_id","strategy_id","user_id","strategy_variant_id","strike"]
+        agg_map = {
+            "account_name": "max",
+            "strategy_name": "max",
+            "portfolio_name": "max",
+            "exec_mode": "max",
+            "realized_pnl": "sum",
+            "fills": "sum",
+        }
+        pnl_out = pnl_out.groupby(_pnl_keys, as_index=False, dropna=False).agg(agg_map)
+
     # Slippage rows (only where theoretical available)
     slip_out = df.loc[theo_ok, [
         "unique_id","timestamp_ist","trade_day","user_id","account_name","strategy_name",
@@ -917,7 +928,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
 
     # ---------- Upserts / Inserts ----------
     with dst_engine.begin() as con:
-        # Slippage (idempotent by unique_key)
+        # Slippage
         if not slip_out.empty:
             slip_out.to_sql("_slip_stage", con, schema="mart", if_exists="replace", index=False)
             con.execute(text("""
@@ -946,19 +957,37 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                 DROP TABLE mart._slip_stage;
             """))
 
-        # PnL (Option A: delete-by-day → insert; NO ON CONFLICT)
+        # PnL (delete-by-day, then INSERT from a dedup CTE)
         if not pnl_out.empty:
             pnl_out.to_sql("_pnl_stage", con, schema="mart", if_exists="replace", index=False)
             con.execute(text("""
                 DELETE FROM mart.trade_pnl
                 WHERE trade_day IN (SELECT DISTINCT trade_day FROM mart._pnl_stage);
 
+                WITH dedup AS (
+                  SELECT
+                    trade_day,
+                    account_id,
+                    strategy_id,
+                    user_id,
+                    strategy_variant_id,
+                    strike,
+                    MAX(account_name)   AS account_name,
+                    MAX(strategy_name)  AS strategy_name,
+                    MAX(portfolio_name) AS portfolio_name,
+                    MAX(exec_mode)      AS exec_mode,
+                    SUM(realized_pnl)   AS realized_pnl,
+                    SUM(fills)          AS fills
+                  FROM mart._pnl_stage
+                  GROUP BY 1,2,3,4,5,6
+                )
                 INSERT INTO mart.trade_pnl
                 (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
                  account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills)
-                SELECT trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
-                       account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills
-                FROM mart._pnl_stage;
+                SELECT
+                  trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
+                  account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills
+                FROM dedup;
 
                 DROP TABLE mart._pnl_stage;
             """))
@@ -1117,7 +1146,7 @@ def main():
     dst = create_engine(REPORT_DB_URL, pool_pre_ping=True)
 
     ensure_dim_schema(dst)
-    ensure_mart_ops_schema(dst)   # includes migration removing trade_number + dedup + view recreation
+    ensure_mart_ops_schema(dst)
     sync_dims(src, dst)
     run_trade_etl(src, dst, args.from_date, args.to_date)
 
