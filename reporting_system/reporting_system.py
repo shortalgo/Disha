@@ -8,12 +8,12 @@ End-to-end: DIM sync (from algo_department.core) + Slippage/PnL ETL + Error flag
 - Runs trade ETL with IST-safe date parsing
 - Adds helpful views + indexes for Metabase
 - Handles cross-day realization via carry-in positions from prior EOD
-- FIX: carry-in rows now get a synthetic unique_id so inserts into mart.trades_all never violate NOT NULL/PK
-- FIX: PnL dedup both in pandas and SQL to avoid PK collisions in mart.trade_pnl
+- FIX: carry-in rows get a synthetic unique_id so mart.trades_all inserts never violate NOT NULL/PK
+- FIX: PnL de-duped both in pandas and SQL to avoid PK collisions in mart.trade_pnl
+- NEW: exit_reason is captured from source → mart.trades_all (and slippage_events)
+- NEW: Slippage override: if exit_reason == 'MANUAL', set slip_abs=0, slip_pct=0
 
-Run examples:
-  python reporting_system.py --from 2025-10-03 --to 2025-10-03
-  python reporting_system.py   # defaults to yesterday
+NOTE: Source column is core.trades.reason_exit (aliased as exit_reason in ETL).
 """
 
 import argparse
@@ -100,7 +100,7 @@ def parse_option_type(s):
 
 def fifo_realized_pnl(group_df):
     """
-    FIFO (First-In, First-Out) within bucket (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
+    FIFO within bucket (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
     Returns: realized_pnl, fills, net_qty, avg_entry, exit_without_open
     """
     g = group_df.sort_values("timestamp_ist").copy()
@@ -271,7 +271,8 @@ CREATE TABLE IF NOT EXISTS mart.trades_all (
   exec_mode           text,
   account_name        text,
   strategy_name       text,
-  portfolio_name      text
+  portfolio_name      text,
+  exit_reason         text
 );
 
 CREATE TABLE IF NOT EXISTS mart.slippage_events (
@@ -288,7 +289,8 @@ CREATE TABLE IF NOT EXISTS mart.slippage_events (
   theoretical_price  double precision,
   slip_abs           double precision,
   slip_pct           double precision,
-  exec_mode          text
+  exec_mode          text,
+  exit_reason        text
 );
 
 CREATE TABLE IF NOT EXISTS mart.trade_pnl (
@@ -674,9 +676,9 @@ def fetch_carry_in_positions(dst_engine, from_date):
 
     start_ts = pd.Timestamp(f"{from_date} 00:00:00").tz_localize(IST_TZ)
     carry = pd.DataFrame({
-        "unique_id": None,  # will be set below
-        "instrument_name": None,
-        "type": None,
+        "unique_id": None,
+        "instrument_name": "CARRY_IN",
+        "type": "CARRY_IN",
         "option_type": None,
         "entry_exit_error": "CARRY_IN",
         "theoretical_price": np.nan,
@@ -697,6 +699,7 @@ def fetch_carry_in_positions(dst_engine, from_date):
         "account_name": df_prev["account_name"],
         "strategy_name": df_prev["strategy_name"],
         "portfolio_name": df_prev["portfolio_name"],
+        "exit_reason": "CARRY_IN"
     })
 
     def _strike_text(val: float) -> str:
@@ -709,8 +712,6 @@ def fetch_carry_in_positions(dst_engine, from_date):
         lambda r: f"CIN:{r['trade_day']}:{str(r['account_id'])}:{str(r['strategy_id'])}:{str(r['user_id'])}:{str(r['strategy_variant_id'])}:{_strike_text(float(r['strike']))}",
         axis=1,
     )
-    carry["instrument_name"] = carry["instrument_name"].fillna("CARRY_IN")
-    carry["type"] = carry["type"].fillna("CARRY_IN")
     return carry
 
 # ================== Trade ETL ==================
@@ -730,6 +731,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
           t.entry_exit_error,
           t.theoretical_price,
           t.theoretical_time,
+          t.reason_exit AS exit_reason,          -- <<<<<<<<<<  SOURCE COLUMN HERE
 
           t.account_id::text  AS account_id,
           t.strategy_id::text AS strategy_id,
@@ -779,10 +781,17 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
         df = pd.concat([carry, df[cols_union]], ignore_index=True)
 
     # ---------- Slippage per fill ----------
+    # Base slippage (only where theoretical is available and > 0)
     theo_ok = df["theoretical_price"].notna() & (df["theoretical_price"] > 0)
     sign    = np.sign(df["qty"].astype(float))
     df["slip_abs"] = np.where(theo_ok, (df["trade_price"] - df["theoretical_price"]) * sign, np.nan)
     df["slip_pct"] = np.where(theo_ok, 100.0 * df["slip_abs"] / df["theoretical_price"], np.nan)
+
+    # ---- Override if exit_reason == 'MANUAL' (case-insensitive) ----
+    exit_reason_lc = df.get("exit_reason").astype(str).str.strip().str.lower()
+    manual_mask = theo_ok & (exit_reason_lc == "manual")
+    df.loc[manual_mask, "slip_abs"] = 0.0
+    df.loc[manual_mask, "slip_pct"] = 0.0
 
     # ---------- Write ALL transformed trades (pre-clubbing) ----------
     with dst_engine.begin() as con:
@@ -791,24 +800,24 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
         cols = ["unique_id","timestamp_ist","trade_day","account_id","strategy_id","user_id",
                 "strategy_variant_id","instrument_name","type","option_type","strike","qty",
                 "trade_price","side","entry_label","theoretical_price","exec_mode",
-                "account_name","strategy_name","portfolio_name"]
+                "account_name","strategy_name","portfolio_name","exit_reason"]
         for c in cols:
             if c not in df_raw.columns:
                 df_raw[c] = None
         df_raw = df_raw[cols]
-        df_raw = df_raw[df_raw["unique_id"].notna()]  # safety
+        df_raw = df_raw[df_raw["unique_id"].notna()]
         df_raw.to_sql("_trades_all_stage", con, schema="mart", if_exists="replace", index=False)
         con.execute(text("""
             INSERT INTO mart.trades_all
             (unique_id, timestamp_ist, trade_day, account_id, strategy_id, user_id,
              strategy_variant_id, instrument_name, type, option_type, strike, qty,
              trade_price, side, entry_label, theoretical_price, exec_mode,
-             account_name, strategy_name, portfolio_name)
+             account_name, strategy_name, portfolio_name, exit_reason)
             SELECT
              unique_id, timestamp_ist, trade_day, account_id, strategy_id, user_id,
              strategy_variant_id, instrument_name, type, option_type, strike, qty,
              trade_price, side, entry_label, theoretical_price, exec_mode,
-             account_name, strategy_name, portfolio_name
+             account_name, strategy_name, portfolio_name, exit_reason
             FROM mart._trades_all_stage
             ON CONFLICT (unique_id) DO UPDATE SET
               timestamp_ist     = EXCLUDED.timestamp_ist,
@@ -820,7 +829,8 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
               exec_mode         = EXCLUDED.exec_mode,
               account_name      = EXCLUDED.account_name,
               strategy_name     = EXCLUDED.strategy_name,
-              portfolio_name    = EXCLUDED.portfolio_name;
+              portfolio_name    = EXCLUDED.portfolio_name,
+              exit_reason       = EXCLUDED.exit_reason;
             DROP TABLE mart._trades_all_stage;
         """))
 
@@ -905,7 +915,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
     pnl_out  = pd.DataFrame(results)
     open_out = pd.DataFrame(openpos)
 
-    # ---- GUARDRAIL: ensure one row per PnL PK in pandas before staging ----
+    # Guardrail: ensure one row per PnL PK in pandas before staging
     if not pnl_out.empty:
         _pnl_keys = ["trade_day","account_id","strategy_id","user_id","strategy_variant_id","strike"]
         agg_map = {
@@ -922,7 +932,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
     slip_out = df.loc[theo_ok, [
         "unique_id","timestamp_ist","trade_day","user_id","account_name","strategy_name",
         "instrument_name","option_type","side","trade_price","theoretical_price",
-        "slip_abs","slip_pct","exec_mode"
+        "slip_abs","slip_pct","exec_mode","exit_reason"
     ]].copy()
     slip_out.rename(columns={"unique_id": "unique_key"}, inplace=True)
 
@@ -935,10 +945,10 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                 INSERT INTO mart.slippage_events AS t
                 (unique_key, timestamp_ist, trade_day, user_id, account_name, strategy_name,
                  instrument_name, option_type, side, trade_price, theoretical_price,
-                 slip_abs, slip_pct, exec_mode)
+                 slip_abs, slip_pct, exec_mode, exit_reason)
                 SELECT unique_key, timestamp_ist, trade_day, user_id, account_name, strategy_name,
                        instrument_name, option_type, side, trade_price, theoretical_price,
-                       slip_abs, slip_pct, exec_mode
+                       slip_abs, slip_pct, exec_mode, exit_reason
                 FROM mart._slip_stage
                 ON CONFLICT (unique_key) DO UPDATE SET
                   timestamp_ist     = EXCLUDED.timestamp_ist,
@@ -953,7 +963,8 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                   theoretical_price = EXCLUDED.theoretical_price,
                   slip_abs          = EXCLUDED.slip_abs,
                   slip_pct          = EXCLUDED.slip_pct,
-                  exec_mode         = EXCLUDED.exec_mode;
+                  exec_mode         = EXCLUDED.exec_mode,
+                  exit_reason       = EXCLUDED.exit_reason;
                 DROP TABLE mart._slip_stage;
             """))
 
