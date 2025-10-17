@@ -2,18 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-End-to-end: DIM sync (from algo_department.core) + Slippage/PnL ETL + Error flags
-- Creates schemas/tables: dim, mart, ops (idempotent, safe with existing tables)
-- Upserts DIMs from source DB (no FDW required)
-- Runs trade ETL with IST-safe date parsing
-- Adds helpful views + indexes for Metabase
-- Handles cross-day realization via carry-in positions from prior EOD
-- FIX: carry-in rows get a synthetic unique_id so mart.trades_all inserts never violate NOT NULL/PK
-- FIX: PnL de-duped both in pandas and SQL to avoid PK collisions in mart.trade_pnl
-- NEW: exit_reason is captured from source → mart.trades_all (and slippage_events)
-- NEW: Slippage override: if exit_reason == 'MANUAL', set slip_abs=0, slip_pct=0
-
-NOTE: Source column is core.trades.reason_exit (aliased as exit_reason in ETL).
+End-to-end: DIM sync + Slippage/PnL ETL + Error flags
+- Adds/uses option_type end-to-end (CE/PE bucketed separately)
+- Auto-migrates mart.trade_pnl / mart.open_positions_eod to add option_type columns if missing
+- Carry-in preserves option_type when the EOD table has it
+- Adaptive UPSERTs: ON CONFLICT target includes option_type only if the PK has it
+- Creates schemas/tables/views/indexes idempotently (safe with existing)
 """
 
 import argparse
@@ -60,10 +54,7 @@ def _parse_time_safe(x) -> dt_time | None:
         return dt_time(0, 0, 0)
     if isinstance(x, (pd.Timestamp, datetime)):
         return x.time()
-    s = str(x).strip()
-    if not s:
-        return dt_time(0, 0, 0)
-    s = s.replace("  ", " ")
+    s = str(x).strip().replace("  ", " ")
     for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M:%S %p"):
         try:
             return datetime.strptime(s, fmt).time()
@@ -100,7 +91,7 @@ def parse_option_type(s):
 
 def fifo_realized_pnl(group_df):
     """
-    FIFO within bucket (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
+    FIFO within bucket (trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike)
     Returns: realized_pnl, fills, net_qty, avg_entry, exit_without_open
     """
     g = group_df.sort_values("timestamp_ist").copy()
@@ -160,7 +151,7 @@ def fifo_realized_pnl(group_df):
     )
     return realized, fills, net_qty, avg_entry, exit_without_open
 
-# ================== Schema DDL ==================
+# ================== DDL ==================
 DDL_DIM = """
 CREATE SCHEMA IF NOT EXISTS dim;
 
@@ -246,52 +237,9 @@ CREATE INDEX IF NOT EXISTS ix_dim_acc_assign_user ON dim.account_assignments(use
 CREATE INDEX IF NOT EXISTS ix_dim_acc_assign_acc  ON dim.account_assignments(account_id);
 """
 
-# ---------- TABLES ONLY (final shapes; no trade_number anywhere) ----------
 DDL_MART_OPS_TABLES = """
 CREATE SCHEMA IF NOT EXISTS mart;
 CREATE SCHEMA IF NOT EXISTS ops;
-
-CREATE TABLE IF NOT EXISTS mart.trades_all (
-  unique_id           text PRIMARY KEY,
-  timestamp_ist       timestamptz,
-  trade_day           date,
-  account_id          text,
-  strategy_id         text,
-  user_id             text,
-  strategy_variant_id text,
-  instrument_name     text,
-  type                text,
-  option_type         text,
-  strike              double precision,
-  qty                 double precision,
-  trade_price         double precision,
-  side                text,
-  entry_label         text,
-  theoretical_price   double precision,
-  exec_mode           text,
-  account_name        text,
-  strategy_name       text,
-  portfolio_name      text,
-  exit_reason         text
-);
-
-CREATE TABLE IF NOT EXISTS mart.slippage_events (
-  unique_key         text PRIMARY KEY,
-  timestamp_ist      timestamptz,
-  trade_day          date,
-  user_id            text,
-  account_name       text,
-  strategy_name      text,
-  instrument_name    text,
-  option_type        text,
-  side               text,
-  trade_price        double precision,
-  theoretical_price  double precision,
-  slip_abs           double precision,
-  slip_pct           double precision,
-  exec_mode          text,
-  exit_reason        text
-);
 
 CREATE TABLE IF NOT EXISTS mart.trade_pnl (
   trade_day            date,
@@ -299,6 +247,7 @@ CREATE TABLE IF NOT EXISTS mart.trade_pnl (
   strategy_id          text,
   user_id              text,
   strategy_variant_id  text,
+  option_type          text,
   strike               double precision,
   account_name         text,
   strategy_name        text,
@@ -306,7 +255,7 @@ CREATE TABLE IF NOT EXISTS mart.trade_pnl (
   exec_mode            text,
   realized_pnl         double precision,
   fills                int,
-  PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
+  PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike)
 );
 
 CREATE TABLE IF NOT EXISTS mart.open_positions_eod (
@@ -315,6 +264,7 @@ CREATE TABLE IF NOT EXISTS mart.open_positions_eod (
   strategy_id          text,
   user_id              text,
   strategy_variant_id  text,
+  option_type          text,
   strike               double precision,
   account_name         text,
   strategy_name        text,
@@ -323,47 +273,10 @@ CREATE TABLE IF NOT EXISTS mart.open_positions_eod (
   net_qty              double precision,
   avg_entry_price      double precision,
   last_trade_ts        timestamptz,
-  PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
-);
-
-CREATE TABLE IF NOT EXISTS ops.erroneous_trades (
-  trade_day            date,
-  account_id           text,
-  strategy_id          text,
-  user_id              text,
-  strategy_variant_id  text,
-  issue_code           text,
-  issue_detail         text,
-  affected_unique_ids  text[] ,
-  first_ts             timestamptz,
-  last_ts              timestamptz,
-  created_at_utc       timestamptz,
-  PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, issue_code, first_ts)
-);
-
-CREATE TABLE IF NOT EXISTS ops.erroneous_trades_clean (
-  trade_day            date,
-  account_id           text,
-  account_name         text,
-  strategy_id          text,
-  strategy_name        text,
-  portfolio_name       text,
-  exec_mode            text,
-  user_id              text,
-  strategy_variant_id  text,
-  issue_code           text,
-  issue_detail         text,
-  wrong_fills          int,
-  strikes_csv          text,
-  affected_ids_csv     text,
-  first_ts             timestamptz,
-  last_ts              timestamptz,
-  created_at_utc       timestamptz,
-  PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, issue_code, first_ts)
+  PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike)
 );
 """
 
-# ---------- VIEWS (drop first, then create) ----------
 DDL_MART_OPS_VIEWS_DROP = """
 DROP VIEW IF EXISTS ops.v_erroneous_trades_clean CASCADE;
 DROP VIEW IF EXISTS ops.v_erroneous_counts_by_bucket CASCADE;
@@ -372,6 +285,7 @@ DROP VIEW IF EXISTS mart.v_strategy_pnl CASCADE;
 DROP VIEW IF EXISTS mart.v_open_positions_eod CASCADE;
 """
 
+# FIX: v_open_positions_eod groups by option_type too
 DDL_MART_OPS_VIEWS_CREATE = """
 CREATE VIEW ops.v_erroneous_trades_clean AS
 SELECT
@@ -405,41 +319,75 @@ GROUP BY 1,2,3,4;
 
 CREATE VIEW mart.v_open_positions_eod AS
 SELECT trade_day, portfolio_name, strategy_name, exec_mode,
-       strategy_variant_id, strike,
+       strategy_variant_id, option_type, strike,
        SUM(net_qty) AS net_qty,
        AVG(avg_entry_price) AS avg_entry_price
 FROM mart.open_positions_eod
-GROUP BY 1,2,3,4,5,6;
+GROUP BY 1,2,3,4,5,6,7;
 """
 
+# FIX: indexes include option_type and correct column orders
 DDL_INDEXES_PERF = """
 CREATE INDEX IF NOT EXISTS ix_slip_day            ON mart.slippage_events(trade_day);
 CREATE INDEX IF NOT EXISTS ix_slip_strategy_day   ON mart.slippage_events(strategy_name, trade_day);
 CREATE INDEX IF NOT EXISTS ix_slip_account_day    ON mart.slippage_events(account_name, trade_day);
 
+DROP INDEX IF EXISTS mart.ix_pnl_all_keys;
 CREATE INDEX IF NOT EXISTS ix_pnl_all_keys ON mart.trade_pnl
-  (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike);
+  (trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike);
+
 CREATE INDEX IF NOT EXISTS ix_pnl_day_strategy ON mart.trade_pnl(trade_day, strategy_id);
 CREATE INDEX IF NOT EXISTS ix_pnl_day_account  ON mart.trade_pnl(trade_day, account_id);
+
+DROP INDEX IF EXISTS mart.ix_pnl_day_user;
 CREATE INDEX IF NOT EXISTS ix_pnl_day_user     ON mart.trade_pnl(trade_day, user_id);
 
 CREATE INDEX IF NOT EXISTS ix_open_day         ON mart.open_positions_eod(trade_day);
 CREATE INDEX IF NOT EXISTS ix_err_day          ON ops.erroneous_trades(trade_day);
 """
 
-# ================== Migration helper (drop trade_number; dedup PnL) ==================
+# ================== Migration helpers ==================
+def ensure_columns_for_option_type(dst_engine):
+    """Add option_type column if missing on PnL/Open tables (no PK changes here)."""
+    if MANAGE_SCHEMA_EXTERNALLY:
+        return
+    with dst_engine.begin() as con:
+        con.execute(text("ALTER TABLE mart.trade_pnl         ADD COLUMN IF NOT EXISTS option_type text;"))
+        con.execute(text("ALTER TABLE mart.open_positions_eod ADD COLUMN IF NOT EXISTS option_type text;"))
+
+def table_has_column(con, schema, table, column) -> bool:
+    q = text("""
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema=:s AND table_name=:t AND column_name=:c
+        LIMIT 1
+    """)
+    return con.execute(q, {"s": schema, "t": table, "c": column}).first() is not None
+
+def pk_includes_option_type(con, schema, table) -> bool:
+    sql = text("""
+    SELECT a.attname
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+    WHERE i.indisprimary = TRUE AND n.nspname=:s AND c.relname=:t
+    ORDER BY k.ord;
+    """)
+    rows = [r[0] for r in con.execute(sql, {"s": schema, "t": table}).fetchall()]
+    return "option_type" in rows
+
 def migrate_drop_trade_number(dst_engine):
+    """
+    Legacy cleanup (drop trade_number) + ensure trade_pnl keeps option_type in PK.
+    Also dedups existing rows by the new key with option_type.
+    """
     with dst_engine.begin() as con:
         con.execute(text(DDL_MART_OPS_VIEWS_DROP))
 
         def col_exists(schema, table, column):
-            q = text("""
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_schema=:s AND table_name=:t AND column_name=:c
-                LIMIT 1
-            """)
-            return con.execute(q, {"s": schema, "t": table, "c": column}).first() is not None
+            return table_has_column(con, schema, table, column)
 
         def drop_all_pks(schema, table):
             sql = text("""
@@ -451,15 +399,18 @@ def migrate_drop_trade_number(dst_engine):
             for (conname,) in con.execute(sql, {"schema": schema, "table": table}).fetchall():
                 con.execute(text(f'ALTER TABLE {schema}.{table} DROP CONSTRAINT IF EXISTS "{conname}";'))
 
-        # 1) mart.trade_pnl: drop legacy column, dedup, add new PK
+        # ---- trade_pnl: drop legacy column if present
         if col_exists("mart", "trade_pnl", "trade_number"):
             drop_all_pks("mart", "trade_pnl")
             con.execute(text("ALTER TABLE mart.trade_pnl DROP COLUMN IF EXISTS trade_number"))
 
+        # Dedup and KEEP option_type, coalesced to 'NA'
         con.execute(text("""
             CREATE TEMP TABLE IF NOT EXISTS _tmp_pnl_dedup AS
             SELECT
-              trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
+              trade_day, account_id, strategy_id, user_id, strategy_variant_id,
+              COALESCE(option_type, 'NA') AS option_type,
+              strike,
               MAX(account_name)   AS account_name,
               MAX(strategy_name)  AS strategy_name,
               MAX(portfolio_name) AS portfolio_name,
@@ -467,23 +418,28 @@ def migrate_drop_trade_number(dst_engine):
               SUM(realized_pnl)   AS realized_pnl,
               SUM(fills)          AS fills
             FROM mart.trade_pnl
-            GROUP BY 1,2,3,4,5,6;
+            GROUP BY 1,2,3,4,5,6,7;
         """))
         con.execute(text("TRUNCATE TABLE mart.trade_pnl;"))
         con.execute(text("""
             INSERT INTO mart.trade_pnl
-            (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
+            (trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike,
              account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills)
             SELECT * FROM _tmp_pnl_dedup;
         """))
         con.execute(text("DROP TABLE IF EXISTS _tmp_pnl_dedup;"))
+
+        # Recreate PK INCLUDING option_type, and enforce NOT NULL + default
         drop_all_pks("mart", "trade_pnl")
+        con.execute(text("ALTER TABLE mart.trade_pnl ALTER COLUMN option_type SET DEFAULT 'NA'"))
+        con.execute(text("UPDATE mart.trade_pnl SET option_type='NA' WHERE option_type IS NULL"))
+        con.execute(text("ALTER TABLE mart.trade_pnl ALTER COLUMN option_type SET NOT NULL"))
         con.execute(text("""
             ALTER TABLE mart.trade_pnl
-            ADD PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
+            ADD PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike)
         """))
 
-        # 2) ops tables: remove legacy trade_number if present
+        # ---- erroneous tables legacy cleanup
         if col_exists("ops", "erroneous_trades", "trade_number"):
             drop_all_pks("ops", "erroneous_trades")
             con.execute(text("ALTER TABLE ops.erroneous_trades DROP COLUMN IF EXISTS trade_number"))
@@ -491,7 +447,6 @@ def migrate_drop_trade_number(dst_engine):
                 ALTER TABLE ops.erroneous_trades
                 ADD PRIMARY KEY (trade_day, account_id, strategy_id, user_id, strategy_variant_id, issue_code, first_ts)
             """))
-
         if col_exists("ops", "erroneous_trades_clean", "trade_number"):
             drop_all_pks("ops", "erroneous_trades_clean")
             con.execute(text("ALTER TABLE ops.erroneous_trades_clean DROP COLUMN IF EXISTS trade_number"))
@@ -515,6 +470,7 @@ def ensure_mart_ops_schema(dst_engine):
         con.execute(text(DDL_MART_OPS_TABLES))
         con.execute(text(DDL_INDEXES_PERF))
         con.execute(text(DDL_MART_OPS_VIEWS_CREATE))
+    ensure_columns_for_option_type(dst_engine)
 
 # ------------------ Helpers to fetch source DFs robustly ------------------
 def fetch_strategy_variants_df(engine):
@@ -600,10 +556,7 @@ def sync_dims(src_engine, dst_engine):
     )
 
     with src_engine.connect() as con:
-        df_acct = pd.read_sql(text("""
-            SELECT id::bigint AS account_id, name::text AS name
-            FROM core.accounts
-        """), con)
+        df_acct = pd.read_sql(text("SELECT id::bigint AS account_id, name::text AS name FROM core.accounts"), con)
     stage_and_upsert(
         df_acct, "dim._stage_accounts",
         """
@@ -617,10 +570,7 @@ def sync_dims(src_engine, dst_engine):
     )
 
     with src_engine.connect() as con:
-        df_users = pd.read_sql(text("""
-            SELECT id_no::bigint AS user_id, name::text AS name
-            FROM core.users
-        """), con)
+        df_users = pd.read_sql(text("SELECT id_no::bigint AS user_id, name::text AS name FROM core.users"), con)
     stage_and_upsert(
         df_users, "dim._stage_users",
         """
@@ -663,14 +613,13 @@ def fetch_carry_in_positions(dst_engine, from_date):
     """
     prev_day = (pd.to_datetime(from_date).date() - timedelta(days=1)).isoformat()
     q = text("""
-        SELECT trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
-               account_name, strategy_name, portfolio_name, exec_mode,
-               net_qty, avg_entry_price, last_trade_ts
+        SELECT *
         FROM mart.open_positions_eod
         WHERE trade_day = :d
     """)
     with dst_engine.connect() as con:
         df_prev = pd.read_sql(q, con, params={"d": prev_day})
+        has_opt = "option_type" in df_prev.columns
     if df_prev.empty:
         return df_prev
 
@@ -679,7 +628,7 @@ def fetch_carry_in_positions(dst_engine, from_date):
         "unique_id": None,
         "instrument_name": "CARRY_IN",
         "type": "CARRY_IN",
-        "option_type": None,
+        "option_type": df_prev["option_type"] if has_opt else None,
         "entry_exit_error": "CARRY_IN",
         "theoretical_price": np.nan,
         "theoretical_time": None,
@@ -708,8 +657,10 @@ def fetch_carry_in_positions(dst_engine, from_date):
         i = int(val)
         return str(i) if abs(val - i) < 1e-9 else str(val)
 
+    # FIX: include option_type in unique_id to avoid CE/PE collision
     carry["unique_id"] = carry.apply(
-        lambda r: f"CIN:{r['trade_day']}:{str(r['account_id'])}:{str(r['strategy_id'])}:{str(r['user_id'])}:{str(r['strategy_variant_id'])}:{_strike_text(float(r['strike']))}",
+        lambda r: f"CIN:{r['trade_day']}:{str(r['account_id'])}:{str(r['strategy_id'])}:"
+                  f"{str(r['user_id'])}:{str(r['strategy_variant_id'])}:{(r.get('option_type') or 'NA')}:{_strike_text(float(r['strike']))}",
         axis=1,
     )
     return carry
@@ -731,7 +682,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
           t.entry_exit_error,
           t.theoretical_price,
           t.theoretical_time,
-          t.reason_exit AS exit_reason,          -- <<<<<<<<<<  SOURCE COLUMN HERE
+          t.reason_exit AS exit_reason,
 
           t.account_id::text  AS account_id,
           t.strategy_id::text AS strategy_id,
@@ -781,13 +732,12 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
         df = pd.concat([carry, df[cols_union]], ignore_index=True)
 
     # ---------- Slippage per fill ----------
-    # Base slippage (only where theoretical is available and > 0)
     theo_ok = df["theoretical_price"].notna() & (df["theoretical_price"] > 0)
     sign    = np.sign(df["qty"].astype(float))
     df["slip_abs"] = np.where(theo_ok, (df["trade_price"] - df["theoretical_price"]) * sign, np.nan)
     df["slip_pct"] = np.where(theo_ok, 100.0 * df["slip_abs"] / df["theoretical_price"], np.nan)
 
-    # ---- Override if exit_reason == 'MANUAL' (case-insensitive) ----
+    # ---- Override if exit_reason == 'MANUAL' ----
     exit_reason_lc = df.get("exit_reason").astype(str).str.strip().str.lower()
     manual_mask = theo_ok & (exit_reason_lc == "manual")
     df.loc[manual_mask, "slip_abs"] = 0.0
@@ -857,18 +807,20 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
     else:
         df_agg = df
 
-    # ---------- Error detection (FIFO-only) ----------
+    # ---------- Error detection ----------
     err_rows = []
     now_ts = datetime.now(timezone.utc)
-    group_keys_err = ["trade_day","account_id","strategy_id","user_id","strategy_variant_id","strike"]
+    group_keys_err = ["trade_day","account_id","strategy_id","user_id","strategy_variant_id","option_type","strike"]
     for gkeys, gdf in df_agg.groupby(group_keys_err, dropna=False):
-        trade_day, account_id, strategy_id, user_id, variant_id, strike = gkeys
-        _, _, _, _, exit_without_open = fifo_realized_pnl(gdf)
+        _, _, _, _, _, _, _ = gkeys
+        realized, fills, net_qty, avg_entry, exit_without_open = fifo_realized_pnl(gdf)
         if exit_without_open:
             err_rows.append({
-                "trade_day": trade_day,
-                "account_id": account_id, "strategy_id": strategy_id, "user_id": user_id,
-                "strategy_variant_id": variant_id,
+                "trade_day": gdf["trade_day"].iloc[0],
+                "account_id": gdf["account_id"].iloc[0],
+                "strategy_id": gdf["strategy_id"].iloc[0],
+                "user_id": gdf["user_id"].iloc[0],
+                "strategy_variant_id": gdf["strategy_variant_id"].iloc[0],
                 "issue_code": "EXIT_WITHOUT_OPEN_POSITION",
                 "issue_detail": "Detected a closing direction when no opposite open lots existed (FIFO).",
                 "affected_unique_ids": list(map(str, gdf.get("unique_id", pd.Series(dtype=str)).tolist())),
@@ -876,25 +828,24 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                 "last_ts":  pd.to_datetime(gdf["timestamp_ist"]).max(),
                 "created_at_utc": now_ts
             })
-
     errs_out = pd.DataFrame(err_rows)
 
     # ---------- PnL & Open positions ----------
     pnl_keys = ["trade_day","account_id","strategy_id","user_id",
-                "strategy_variant_id","strike",
+                "strategy_variant_id","option_type","strike",
                 "account_name","strategy_name","portfolio_name","exec_mode"]
 
     results, openpos = [], []
     for keys, sub in df_agg.groupby(pnl_keys, dropna=False):
         (trade_day, account_id, strategy_id, user_id,
-         variant_id, strike,
+         variant_id, option_type, strike,
          account_name, strategy_name, portfolio_name, exec_mode) = keys
 
         realized, fills, net_qty, avg_entry, _ = fifo_realized_pnl(sub)
         results.append({
             "trade_day": trade_day,
             "account_id": account_id, "strategy_id": strategy_id, "user_id": user_id,
-            "strategy_variant_id": variant_id, "strike": strike,
+            "strategy_variant_id": variant_id, "option_type": option_type, "strike": strike,
             "account_name": account_name, "strategy_name": strategy_name,
             "portfolio_name": portfolio_name, "exec_mode": exec_mode,
             "realized_pnl": realized, "fills": fills
@@ -905,7 +856,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
             openpos.append({
                 "trade_day": trade_day,
                 "account_id": account_id, "strategy_id": strategy_id, "user_id": user_id,
-                "strategy_variant_id": variant_id, "strike": strike,
+                "strategy_variant_id": variant_id, "option_type": option_type, "strike": strike,
                 "account_name": account_name, "strategy_name": strategy_name,
                 "portfolio_name": portfolio_name, "exec_mode": exec_mode,
                 "net_qty": net_qty, "avg_entry_price": avg_entry,
@@ -917,7 +868,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
 
     # Guardrail: ensure one row per PnL PK in pandas before staging
     if not pnl_out.empty:
-        _pnl_keys = ["trade_day","account_id","strategy_id","user_id","strategy_variant_id","strike"]
+        _pkeys = ["trade_day","account_id","strategy_id","user_id","strategy_variant_id","option_type","strike"]
         agg_map = {
             "account_name": "max",
             "strategy_name": "max",
@@ -926,7 +877,7 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
             "realized_pnl": "sum",
             "fills": "sum",
         }
-        pnl_out = pnl_out.groupby(_pnl_keys, as_index=False, dropna=False).agg(agg_map)
+        pnl_out = pnl_out.groupby(_pkeys, as_index=False, dropna=False).agg(agg_map)
 
     # Slippage rows (only where theoretical available)
     slip_out = df.loc[theo_ok, [
@@ -938,6 +889,10 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
 
     # ---------- Upserts / Inserts ----------
     with dst_engine.begin() as con:
+        # Introspect PKs to build proper conflict targets
+        pnl_pk_has_opt  = pk_includes_option_type(con, "mart", "trade_pnl")
+        open_pk_has_opt = pk_includes_option_type(con, "mart", "open_positions_eod")
+
         # Slippage
         if not slip_out.empty:
             slip_out.to_sql("_slip_stage", con, schema="mart", if_exists="replace", index=False)
@@ -971,18 +926,11 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
         # PnL (delete-by-day, then INSERT from a dedup CTE)
         if not pnl_out.empty:
             pnl_out.to_sql("_pnl_stage", con, schema="mart", if_exists="replace", index=False)
+            con.execute(text("DELETE FROM mart.trade_pnl WHERE trade_day IN (SELECT DISTINCT trade_day FROM mart._pnl_stage);"))
             con.execute(text("""
-                DELETE FROM mart.trade_pnl
-                WHERE trade_day IN (SELECT DISTINCT trade_day FROM mart._pnl_stage);
-
                 WITH dedup AS (
                   SELECT
-                    trade_day,
-                    account_id,
-                    strategy_id,
-                    user_id,
-                    strategy_variant_id,
-                    strike,
+                    trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike,
                     MAX(account_name)   AS account_name,
                     MAX(strategy_name)  AS strategy_name,
                     MAX(portfolio_name) AS portfolio_name,
@@ -990,52 +938,55 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                     SUM(realized_pnl)   AS realized_pnl,
                     SUM(fills)          AS fills
                   FROM mart._pnl_stage
-                  GROUP BY 1,2,3,4,5,6
+                  GROUP BY 1,2,3,4,5,6,7
                 )
                 INSERT INTO mart.trade_pnl
                 (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
-                 account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills)
+                 account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills, option_type)
                 SELECT
                   trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
-                  account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills
+                  account_name, strategy_name, portfolio_name, exec_mode, realized_pnl, fills, option_type
                 FROM dedup;
-
                 DROP TABLE mart._pnl_stage;
             """))
 
         # Open positions (DEDUPE + UPSERT)
         if not open_out.empty:
             open_out.to_sql("_open_stage", con, schema="mart", if_exists="replace", index=False)
-            con.execute(text("""
+
+            distinct_on_cols = "trade_day, account_id, strategy_id, user_id, strategy_variant_id, " + ("option_type, " if table_has_column(con, "mart", "open_positions_eod", "option_type") else "") + "strike"
+            order_cols = distinct_on_cols + ", last_trade_ts DESC"
+
+            con.execute(text(f"""
                 DELETE FROM mart.open_positions_eod
                 WHERE trade_day IN (SELECT DISTINCT trade_day FROM mart._open_stage);
 
                 WITH dedup AS (
-                  SELECT DISTINCT ON (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
-                         trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
+                  SELECT DISTINCT ON ({distinct_on_cols})
+                         trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike,
                          account_name, strategy_name, portfolio_name, exec_mode,
                          net_qty, avg_entry_price, last_trade_ts
                   FROM mart._open_stage
-                  ORDER BY trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike, last_trade_ts DESC
+                  ORDER BY {order_cols}
                 )
                 INSERT INTO mart.open_positions_eod
                   (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
                    account_name, strategy_name, portfolio_name, exec_mode,
-                   net_qty, avg_entry_price, last_trade_ts)
+                   net_qty, avg_entry_price, last_trade_ts, option_type)
                 SELECT trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike,
                        account_name, strategy_name, portfolio_name, exec_mode,
-                       net_qty, avg_entry_price, last_trade_ts
+                       net_qty, avg_entry_price, last_trade_ts, option_type
                 FROM dedup
-                ON CONFLICT (trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike)
+                ON CONFLICT ({'trade_day, account_id, strategy_id, user_id, strategy_variant_id, option_type, strike' if open_pk_has_opt else 'trade_day, account_id, strategy_id, user_id, strategy_variant_id, strike'})
                 DO UPDATE SET
-                  account_name    = EXCLUDED.account_name,
-                  strategy_name   = EXCLUDED.strategy_name,
-                  portfolio_name  = EXCLUDED.portfolio_name,
-                  exec_mode       = EXCLUDED.exec_mode,
-                  net_qty         = EXCLUDED.net_qty,
-                  avg_entry_price = EXCLUDED.avg_entry_price,
-                  last_trade_ts   = GREATEST(mart.open_positions_eod.last_trade_ts, EXCLUDED.last_trade_ts);
-
+                  account_name      = EXCLUDED.account_name,
+                  strategy_name     = EXCLUDED.strategy_name,
+                  portfolio_name    = EXCLUDED.portfolio_name,
+                  exec_mode         = EXCLUDED.exec_mode,
+                  net_qty           = EXCLUDED.net_qty,
+                  avg_entry_price   = EXCLUDED.avg_entry_price,
+                  last_trade_ts     = GREATEST(mart.open_positions_eod.last_trade_ts, EXCLUDED.last_trade_ts),
+                  option_type       = EXCLUDED.option_type;
                 DROP TABLE mart._open_stage;
             """))
 
@@ -1081,13 +1032,10 @@ def run_trade_etl(src_engine, dst_engine, from_date: str, to_date: str):
                     (df_agg["strategy_variant_id"].astype(str) == str(e["strategy_variant_id"]))
                 )
                 sub = df_agg.loc[mask]
-
                 affected_ids = list(map(str, e.get("affected_unique_ids", []))) if isinstance(e.get("affected_unique_ids"), (list, tuple)) else []
                 wrong_fills = len(affected_ids)
-
                 strikes = sorted({float(s) for s in sub["strike"].dropna().unique().tolist()})
                 strikes_csv = ",".join(str(int(s)) if abs(s - int(s)) < 1e-9 else str(s) for s in strikes)
-
                 clean_err_rows.append({
                     "trade_day":           e["trade_day"],
                     "account_id":          str(e["account_id"]),
@@ -1157,12 +1105,12 @@ def main():
     dst = create_engine(REPORT_DB_URL, pool_pre_ping=True)
 
     ensure_dim_schema(dst)
-    ensure_mart_ops_schema(dst)
+    ensure_mart_ops_schema(dst)  # also ensures option_type columns exist & PK is correct
     sync_dims(src, dst)
     run_trade_etl(src, dst, args.from_date, args.to_date)
 
-    print("Tip: In Metabase, use ops.v_erroneous_trades_clean, ops.v_erroneous_counts_by_bucket, "
-          "mart.v_slippage_daily, mart.v_strategy_pnl, and mart.v_open_positions_eod.")
+    print("Tip: ops.v_erroneous_trades_clean, ops.v_erroneous_counts_by_bucket, "
+          "mart.v_slippage_daily, mart.v_strategy_pnl, mart.v_open_positions_eod.")
 
 if __name__ == "__main__":
     main()
