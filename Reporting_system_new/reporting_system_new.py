@@ -4,6 +4,7 @@
 reporting_system_new.py
 
 Source: core.trades
+
 Targets (schema: reports):
   - fifo_inventory_today  : ticket-scoped FIFO state per trade_day
   - fetched_eod_prices    : EOD marks per (date, instrument, type, strike, expiry)
@@ -13,11 +14,19 @@ Targets (schema: reports):
 Implements:
 - Ticket-scoped FIFO (partition includes trade_number via position_key_trade).
 - EOD marking using fetched_eod_prices (latest retrieved_at).
-- Auto-close after expiry at expiry-day mark.
+- Auto-close AT / AFTER expiry-day mark (trade_day >= expiry_date) so P&L is realized on expiry.
 - Daily aggregation into reports.pnl_daily.
 - No fees.
 - QA summary of missing marks and auto-closes.
 - Enqueue of open positions into reports.fetched_eod_prices as NULL-price rows.
+- Missing mark handling:
+    * Primary: Upstox EOD marks in fetched_eod_prices.
+    * Fallback: previous day's implied price (prev_mv / prev_qty) when available.
+    * As a last resort, mv_eod=0 (flagged via QA).
+- Correct unrealized P&L:
+    * unrealized_pnl (per ticket) = (eod_price - avg_cost_fifo) * eod_net_qty
+    * prev_unrealized_pnl from previous eod_positions row for that ticket
+    * pnl_daily.unrealized_change = sum(unrealized_pnl - prev_unrealized_pnl)
 """
 
 import argparse
@@ -25,6 +34,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional, Iterable, Dict
 from collections import defaultdict
+from itertools import groupby
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, URL
@@ -267,7 +277,9 @@ insert into "{cfg.rpt_schema}"."eod_positions" as t(
   realized_pnl_fifo_today,
   carry_in,
   prev_eod_qty,
-  prev_mv_eod
+  prev_mv_eod,
+  unrealized_pnl,
+  prev_unrealized_pnl
 )
 values (
   :trade_day,
@@ -287,7 +299,9 @@ values (
   :realized_pnl_fifo_today,
   :carry_in,
   :prev_eod_qty,
-  :prev_mv_eod
+  :prev_mv_eod,
+  :unrealized_pnl,
+  :prev_unrealized_pnl
 )
 on conflict (trade_day, position_key_trade)
 do update set
@@ -298,11 +312,14 @@ do update set
   realized_pnl_fifo_today = excluded.realized_pnl_fifo_today,
   carry_in                = excluded.carry_in,
   prev_eod_qty            = excluded.prev_eod_qty,
-  prev_mv_eod             = excluded.prev_mv_eod;
+  prev_mv_eod             = excluded.prev_mv_eod,
+  unrealized_pnl          = excluded.unrealized_pnl,
+  prev_unrealized_pnl     = excluded.prev_unrealized_pnl;
 """
 
 
 def sql_upsert_pnl_daily(cfg: Config) -> str:
+    # Uses realized_pnl_fifo_today and change in unrealized_pnl
     return f"""
 insert into "{cfg.rpt_schema}"."pnl_daily" as d(
   trade_day,
@@ -321,9 +338,12 @@ select
   strategy_id,
   strategy_variant_id,
   user_id,
-  sum(realized_pnl_fifo_today) as realized_cash_today,
-  sum(coalesce(mv_eod,0) - coalesce(prev_mv_eod,0)) as unrealized_change,
-  sum(realized_pnl_fifo_today + (coalesce(mv_eod,0) - coalesce(prev_mv_eod,0))) as total_pnl_day,
+  sum(realized_pnl_fifo_today)                                       as realized_cash_today,
+  sum(coalesce(unrealized_pnl,0) - coalesce(prev_unrealized_pnl,0))  as unrealized_change,
+  sum(
+      realized_pnl_fifo_today
+      + (coalesce(unrealized_pnl,0) - coalesce(prev_unrealized_pnl,0))
+  )                                                                  as total_pnl_day,
   null::numeric
 from "{cfg.rpt_schema}"."eod_positions"
 where trade_day = :day
@@ -511,7 +531,19 @@ def get_best_expiry_close(conn: Connection, cfg: Config,
 
 
 def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int:
-    """Per-ticket EOD snapshot. Returns count of rows missing marks."""
+    """
+    Per-ticket EOD snapshot.
+
+    For each (position_key_trade, day):
+      - Determine eod_price:
+          * from fetched_eod_prices
+          * fallback: previous implied price (prev_mv/prev_qty)
+      - mv_eod = eod_price * eod_net_qty  (if price known)
+      - unrealized_pnl = (eod_price - avg_cost_fifo) * eod_net_qty
+      - prev_unrealized_pnl from latest prior eod_positions row
+    Returns:
+      count of tickets where primary Upstox mark was missing (even if fallback used).
+    """
     missing_marks = 0
 
     fifo_rows = run_sql(conn, f"""
@@ -524,21 +556,9 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
     for r in fifo_rows:
         pk = r["position_key_trade"]
 
-        eod_price = get_best_mark(
-            conn, cfg,
-            day,
-            r["instrument_name"],
-            r["option_type"],
-            float(r["strike"]),
-            r["expiry_date"]
-        )
-        if eod_price is None:
-            missing_marks += 1
-
-        mv_eod = float(eod_price or 0.0) * float(r["eod_net_qty"])
-
+        # Previous snapshot (if any)
         prev = run_sql(conn, f"""
-            select eod_net_qty, mv_eod
+            select eod_net_qty, mv_eod, unrealized_pnl
             from "{cfg.rpt_schema}"."eod_positions"
             where position_key_trade = :pk
               and trade_day = (
@@ -549,36 +569,94 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
               )
         """, pk=pk, day=day).fetchone()
 
-        prev_qty = prev[0] if prev else None
-        prev_mv  = prev[1] if prev else None
-        carry_in = (prev_qty is not None and float(prev_qty) != 0.0)
+        prev_qty = float(prev[0]) if prev and prev[0] is not None else None
+        prev_mv = float(prev[1]) if prev and prev[1] is not None else None
+        prev_unreal = float(prev[2]) if prev and prev[2] is not None else 0.0
+        carry_in = (prev_qty is not None and prev_qty != 0.0)
+
+        # Primary mark from Upstox / fetched_eod_prices
+        eod_price = get_best_mark(
+            conn, cfg,
+            day,
+            r["instrument_name"],
+            r["option_type"],
+            float(r["strike"]),
+            r["expiry_date"]
+        )
+
+        used_fallback = False
+
+        if eod_price is None:
+            # Track missing primary marks
+            missing_marks += 1
+
+            # Fallback: previous implied price if we had a position and mv
+            prev_price = None
+            if prev_qty is not None and prev_mv is not None and prev_qty != 0.0:
+                prev_price = prev_mv / prev_qty
+
+            if prev_price is not None:
+                eod_price = prev_price
+                used_fallback = True
+
+        # Compute mv_eod
+        qty = float(r["eod_net_qty"])
+        avg_cost = float(r["avg_cost_fifo"]) if r["avg_cost_fifo"] is not None else None
+
+        if eod_price is not None:
+            px = float(eod_price)
+            mv_eod = px * qty
+        else:
+            # Last resort: no mark at all
+            mv_eod = 0.0
+
+        # Compute unrealized P&L vs FIFO cost (your notebook formula)
+        if eod_price is not None and avg_cost is not None and qty != 0.0:
+            px = float(eod_price)
+            unrealized_pnl = (px - avg_cost) * qty
+        else:
+            unrealized_pnl = 0.0
 
         run_sql(conn, sql_upsert_eod_pos(cfg),
-            trade_day          = day,
-            position_key_trade = pk,
-            account_id         = r["account_id"],
-            strategy_id        = r["strategy_id"],
-            strategy_variant_id= r["strategy_variant_id"],
-            user_id            = r["user_id"],
-            instrument_name    = r["instrument_name"],
-            option_type        = r["option_type"],
-            strike             = r["strike"],
-            expiry_date        = r["expiry_date"],
-            eod_net_qty        = r["eod_net_qty"],
-            avg_cost_fifo      = r["avg_cost_fifo"],
-            eod_price          = eod_price,
-            mv_eod             = mv_eod,
+            trade_day               = day,
+            position_key_trade      = pk,
+            account_id              = r["account_id"],
+            strategy_id             = r["strategy_id"],
+            strategy_variant_id     = r["strategy_variant_id"],
+            user_id                 = r["user_id"],
+            instrument_name         = r["instrument_name"],
+            option_type             = r["option_type"],
+            strike                  = r["strike"],
+            expiry_date             = r["expiry_date"],
+            eod_net_qty             = r["eod_net_qty"],
+            avg_cost_fifo           = r["avg_cost_fifo"],
+            eod_price               = eod_price,
+            mv_eod                  = mv_eod,
             realized_pnl_fifo_today = r["realized_pnl_fifo_today"],
-            carry_in           = carry_in,
-            prev_eod_qty       = prev_qty,
-            prev_mv_eod        = prev_mv
+            carry_in                = carry_in,
+            prev_eod_qty            = prev_qty,
+            prev_mv_eod             = prev_mv,
+            unrealized_pnl          = unrealized_pnl,
+            prev_unrealized_pnl     = prev_unreal
         )
 
     return missing_marks
 
 
 def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> int:
-    """Auto-close tickets still open after expiry using expiry mark."""
+    """
+    Auto-close tickets still open ON or AFTER expiry using expiry mark.
+
+    For rows with:
+      trade_day = :day
+      eod_net_qty <> 0
+      trade_day >= expiry_date
+
+    Steps:
+      - Get expiry price (expiry day mark or last <= expiry).
+      - Realize remaining P&L vs avg_cost_fifo into realized_pnl_fifo_today.
+      - Set qty=0, mv_eod=0, avg_cost_fifo=NULL, unrealized_pnl=0.
+    """
     rows = run_sql(conn, f"""
         select
           position_key_trade,
@@ -591,7 +669,7 @@ def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> in
         from "{cfg.rpt_schema}"."eod_positions"
         where trade_day = :day
           and eod_net_qty <> 0
-          and trade_day > expiry_date
+          and trade_day >= expiry_date
     """, day=day).mappings().all()
 
     applied = 0
@@ -605,26 +683,29 @@ def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> in
             r["expiry_date"]
         )
         if expiry_px is None:
+            # No expiry price; leave as-is, QA will show missing marks.
             continue
 
+        px = float(expiry_px)
         qty = float(r["eod_net_qty"])
-        ac  = float(r["avg_cost_fifo"] or 0.0)
+        ac = float(r["avg_cost_fifo"] or 0.0)
 
         if qty > 0:
-            realized_bump = (expiry_px - ac) * qty
+            realized_bump = (px - ac) * qty
         else:
-            realized_bump = (ac - expiry_px) * abs(qty)
+            realized_bump = (ac - px) * abs(qty)
 
         run_sql(conn, f"""
             update "{cfg.rpt_schema}"."eod_positions"
-               set realized_pnl_fifo_today = coalesce(realized_pnl_fifo_today,0) + :add_real,
+               set realized_pnl_fifo_today = coalesce(realized_pnl_fifo_today, 0) + :add_real,
                    eod_price               = :px,
                    mv_eod                  = 0,
                    eod_net_qty             = 0,
-                   avg_cost_fifo           = null
+                   avg_cost_fifo           = null,
+                   unrealized_pnl          = 0
              where trade_day = :day
                and position_key_trade = :pk
-        """, add_real=realized_bump, px=expiry_px, day=day, pk=r["position_key_trade"])
+        """, add_real=realized_bump, px=px, day=day, pk=r["position_key_trade"])
 
         applied += 1
 
@@ -642,20 +723,18 @@ def run_pipeline(cfg: Config):
     qa = QAStats()
 
     with get_conn(cfg.db_url) as conn:
-        # 0) Working FIFO table
+        # 0) Ensure FIFO working table exists
         run_sql(conn, sql_create_fifo_work(cfg))
 
-        # 1) QA: unparsable dates
+        # 1) QA: unparsable trade_date
         count_unparsable_trade_dates(conn, cfg, qa)
 
-        # 2) FIFO per ticket
+        # 2) FIFO for all tickets across the window
         rows = run_sql(conn, sql_select_trades(cfg),
                        d_from=cfg.start_date,
                        d_to=cfg.end_date).mappings().all()
 
-        from itertools import groupby
-        keyfunc = lambda r: r["position_key_trade"]
-        for _, group in groupby(rows, key=keyfunc):
+        for _, group in groupby(rows, key=lambda r: r["position_key_trade"]):
             process_bucket(conn, cfg, group)
 
         # 3) Per-day: enqueue marks → build EOD → autoclose → pnl_daily
