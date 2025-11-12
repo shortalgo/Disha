@@ -31,15 +31,14 @@ Implements:
 
 import argparse
 from dataclasses import dataclass
-from datetime import date, timedelta
-from typing import Optional, Iterable, Dict
+from datetime import date
+from typing import Optional, Iterable, Dict, List
 from collections import defaultdict
 from itertools import groupby
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, URL
 from sqlalchemy.exc import OperationalError
-
 
 # -------------------------
 # HARD-CODED DB URL
@@ -68,7 +67,7 @@ class Config:
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Run reports pipeline (FIFO + EOD + auto-close + P&L).")
+    p = argparse.ArgumentParser(description="Run reports pipeline (FIFO + MTM + auto-close + P&L).")
     p.add_argument("--from", dest="dfrom", required=True, help="Start date YYYY-MM-DD")
     p.add_argument("--to",   dest="dto",   required=True, help="End date YYYY-MM-DD")
     a = p.parse_args()
@@ -78,9 +77,9 @@ def parse_args() -> Config:
     )
 
 
-# -------------------------
+# ---------------------------------------------------------------------
 # QA tracker
-# -------------------------
+# ---------------------------------------------------------------------
 class QAStats:
     def __init__(self):
         self.missing_marks_by_day = defaultdict(int)
@@ -91,9 +90,9 @@ class QAStats:
         self.unparsable_trade_date_in_window = 0
 
 
-# -------------------------
+# ---------------------------------------------------------------------
 # DB helpers
-# -------------------------
+# ---------------------------------------------------------------------
 def run_sql(conn: Connection, sql: str, **params):
     return conn.execute(text(sql), params)
 
@@ -109,9 +108,61 @@ def get_conn(db_url: URL):
         raise
 
 
-# -------------------------
-# SQL helpers
-# -------------------------
+# ---------------------------------------------------------------------
+# TRADING CALENDAR HELPERS
+# ---------------------------------------------------------------------
+def get_trading_days(conn: Connection, cfg: Config) -> List[date]:
+    """
+    Returns ordered list of trading days between cfg.start_date and cfg.end_date
+    based on core.trading_calendar.is_trading_day = true.
+    If calendar is missing/empty, falls back to all calendar days (to avoid hard break).
+    """
+    rows = run_sql(
+        conn,
+        """
+        SELECT trade_date
+        FROM core.trading_calendar
+        WHERE trade_date BETWEEN :d_from AND :d_to
+          AND is_trading_day = true
+        ORDER BY trade_date
+        """,
+        d_from=cfg.start_date,
+        d_to=cfg.end_date,
+    ).fetchall()
+
+    if not rows:
+        # Fallback: use every calendar day (keeps old behavior if calendar not loaded)
+        print("[WARN] trading_calendar empty or missing; using all calendar days.")
+        cur = cfg.start_date
+        out = []
+        while cur <= cfg.end_date:
+            out.append(cur)
+            cur = cur.fromordinal(cur.toordinal() + 1)
+        return out
+
+    return [r[0] for r in rows]
+
+
+def get_prev_trading_day(conn: Connection, day: date) -> Optional[date]:
+    """
+    Previous trading day strictly before `day` from core.trading_calendar.
+    """
+    row = run_sql(
+        conn,
+        """
+        SELECT max(trade_date)
+        FROM core.trading_calendar
+        WHERE trade_date < :day
+          AND is_trading_day = true
+        """,
+        day=day,
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+# ---------------------------------------------------------------------
+# SCHEMA: FIFO WORK TABLE
+# ---------------------------------------------------------------------
 def sql_create_fifo_work(cfg: Config) -> str:
     return f"""
 create table if not exists "{cfg.rpt_schema}"."fifo_inventory_today" (
@@ -136,6 +187,9 @@ create table if not exists "{cfg.rpt_schema}"."fifo_inventory_today" (
 """
 
 
+# ---------------------------------------------------------------------
+# SELECT TRADES
+# ---------------------------------------------------------------------
 def sql_select_trades(cfg: Config) -> str:
     return f"""
 select
@@ -144,14 +198,14 @@ select
   t.strategy_variant_id,
   t.user_id,
   t.instrument_name,
-  upper((t.type)::text)                    as option_type,
-  (t.strike)::numeric                      as strike,
-  (t.expiry_date)::date                    as expiry_date,
-  (t.trade_number)::bigint                 as trade_number,
-  t.trade_time                             as trade_ts,
+  upper((t.type)::text)                      as option_type,
+  (t.strike)::numeric                        as strike,
+  (t.expiry_date)::date                      as expiry_date,
+  (t.trade_number)::bigint                   as trade_number,
+  t.trade_time                               as trade_ts,
   to_date((t.trade_date)::text,'YYYY-MM-DD') as trade_day,
-  (t.qty)::numeric                         as qty,
-  (t.trade_price)::numeric                 as trade_price,
+  (t.qty)::numeric                           as qty,
+  (t.trade_price)::numeric                   as trade_price,
   concat_ws('||',
     t.account_id,
     t.strategy_id,
@@ -173,6 +227,9 @@ order by
 """
 
 
+# ---------------------------------------------------------------------
+# UPSERT FIFO DAY
+# ---------------------------------------------------------------------
 def sql_upsert_fifo_day(cfg: Config) -> str:
     return f"""
 insert into "{cfg.rpt_schema}"."fifo_inventory_today" as f(
@@ -214,6 +271,9 @@ on conflict (position_key_trade, trade_day) do update set
 """
 
 
+# ---------------------------------------------------------------------
+# PRICE LOOKUPS
+# ---------------------------------------------------------------------
 def sql_best_mark(cfg: Config) -> str:
     return f"""
 select price
@@ -256,8 +316,32 @@ limit 1;
 """
 
 
+def get_best_mark(conn: Connection, cfg: Config, day: date,
+                  instr: str, otype: str, strike: float, expiry) -> Optional[float]:
+    row = run_sql(conn, sql_best_mark(cfg),
+                  day=day, instr=instr, otype=otype, strike=strike, expiry=expiry).fetchone()
+    if not row or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def get_best_expiry_close(conn: Connection, cfg: Config,
+                          instr: str, otype: str, strike: float, expiry) -> Optional[float]:
+    row = run_sql(conn, sql_best_expiry_close(cfg),
+                  instr=instr, otype=otype, strike=strike, expiry=expiry).fetchone()
+    if row and row[0] is not None:
+        return float(row[0])
+    row = run_sql(conn, sql_best_expiry_fallback(cfg),
+                  instr=instr, otype=otype, strike=strike, expiry=expiry).fetchone()
+    if not row or row[0] is None:
+        return None
+    return float(row[0])
+
+
+# ---------------------------------------------------------------------
+# UPSERT EOD POSITIONS
+# ---------------------------------------------------------------------
 def sql_upsert_eod_pos(cfg: Config) -> str:
-    # Ticket-scoped EOD, PK (trade_day, position_key_trade)
     return f"""
 insert into "{cfg.rpt_schema}"."eod_positions" as t(
   trade_day,
@@ -318,8 +402,10 @@ do update set
 """
 
 
+# ---------------------------------------------------------------------
+# UPSERT DAILY PNL
+# ---------------------------------------------------------------------
 def sql_upsert_pnl_daily(cfg: Config) -> str:
-    # Uses realized_pnl_fifo_today and change in unrealized_pnl
     return f"""
 insert into "{cfg.rpt_schema}"."pnl_daily" as d(
   trade_day,
@@ -356,38 +442,13 @@ do update set
 """
 
 
-# ---- QA SQL helpers ----
-def sql_count_unparsable_trade_date_total(cfg: Config) -> str:
-    return f"""
-select count(*)::bigint
-from "{cfg.src_schema}"."{cfg.src_table}" t
-where to_date(t.trade_date::text, 'YYYY-MM-DD') is null;
-"""
+def upsert_pnl_daily(conn: Connection, cfg: Config, day: date):
+    run_sql(conn, sql_upsert_pnl_daily(cfg), day=day)
 
 
-def sql_count_unparsable_trade_date_in_window(cfg: Config) -> str:
-    return f"""
-select count(*)::bigint
-from "{cfg.src_schema}"."{cfg.src_table}" t
-where to_date(t.trade_date::text, 'YYYY-MM-DD') is null
-  and t.trade_date::text >= :d_from_text
-  and t.trade_date::text <= :d_to_text;
-"""
-
-
-def count_unparsable_trade_dates(conn: Connection, cfg: Config, qa: QAStats):
-    qa.unparsable_trade_date_total = run_sql(conn, sql_count_unparsable_trade_date_total(cfg)).scalar_one()
-    qa.unparsable_trade_date_in_window = run_sql(
-        conn,
-        sql_count_unparsable_trade_date_in_window(cfg),
-        d_from_text=cfg.start_date.isoformat(),
-        d_to_text=cfg.end_date.isoformat()
-    ).scalar_one()
-
-
-# -------------------------
-# FIFO engine (ticket-scoped)
-# -------------------------
+# ---------------------------------------------------------------------
+# FIFO ENGINE
+# ---------------------------------------------------------------------
 class FifoState:
     __slots__ = ("q_running", "cost_total", "avg_cost", "realized_today", "last_day")
 
@@ -467,83 +528,66 @@ def process_bucket(conn: Connection, cfg: Config, rows: Iterable[Dict]):
         sql_upsert_fifo_day_call(conn, cfg, r, st)
 
 
-# -------------------------
-# ENQUEUE step: open positions needing marks
-# -------------------------
-def sql_enqueue_eod_marks(cfg: Config) -> str:
+# ---------------------------------------------------------------------
+# CARRY-FORWARD (OPEN POSITIONS -> fifo_inventory_today)
+# ---------------------------------------------------------------------
+def sql_fifo_carry_forward(cfg: Config) -> str:
     return f"""
-insert into "{cfg.rpt_schema}"."fetched_eod_prices" (
-    date,
+insert into "{cfg.rpt_schema}"."fifo_inventory_today" (
+    position_key_trade,
+    account_id,
+    strategy_id,
+    strategy_variant_id,
+    user_id,
     instrument_name,
     option_type,
     strike,
     expiry_date,
-    price,
-    retrieved_at
+    trade_number,
+    trade_day,
+    eod_net_qty,
+    avg_cost_fifo,
+    realized_pnl_fifo_today
 )
-select distinct
-    cast(:day as date)      as date,
-    f.instrument_name::text,
-    f.option_type::text,
-    f.strike::numeric,
-    f.expiry_date::date,
-    null::numeric           as price,
-    now()                   as retrieved_at
-from "{cfg.rpt_schema}"."fifo_inventory_today" f
-where f.trade_day = cast(:day as date)
-  and f.eod_net_qty <> 0
+select
+    e.position_key_trade,
+    e.account_id,
+    e.strategy_id,
+    e.strategy_variant_id,
+    e.user_id,
+    e.instrument_name,
+    e.option_type,
+    e.strike,
+    e.expiry_date,
+    null::bigint as trade_number,
+    :day         as trade_day,
+    e.eod_net_qty,
+    e.avg_cost_fifo,
+    0::numeric   as realized_pnl_fifo_today
+from "{cfg.rpt_schema}"."eod_positions" e
+where e.trade_day = :prev_day
+  and e.eod_net_qty <> 0
+  and e.expiry_date > :prev_day
   and not exists (
-      select 1
-      from "{cfg.rpt_schema}"."fetched_eod_prices" p
-      where p.date            = cast(:day as date)
-        and p.instrument_name = f.instrument_name
-        and p.option_type     = f.option_type
-        and p.strike          = f.strike
-        and p.expiry_date     = f.expiry_date
+        select 1
+        from "{cfg.rpt_schema}"."fifo_inventory_today" f
+        where f.trade_day = :day
+          and f.position_key_trade = e.position_key_trade
   );
 """
 
 
-def enqueue_eod_marks(conn: Connection, cfg: Config, day: date) -> int:
-    res = run_sql(conn, sql_enqueue_eod_marks(cfg), day=day)
-    return res.rowcount or 0
+def ensure_fifo_carry_forward(conn: Connection, cfg: Config, day: date):
+    prev_trading_day = get_prev_trading_day(conn, day)
+    if not prev_trading_day:
+        return
+    run_sql(conn, sql_fifo_carry_forward(cfg), day=day, prev_day=prev_trading_day)
 
 
-# -------------------------
-# EOD + auto-close + P&L
-# -------------------------
-def get_best_mark(conn: Connection, cfg: Config, day: date,
-                  instr: str, otype: str, strike: float, expiry) -> Optional[float]:
-    row = run_sql(conn, sql_best_mark(cfg),
-                  day=day, instr=instr, otype=otype, strike=strike, expiry=expiry).fetchone()
-    return None if row is None else row[0]
-
-
-def get_best_expiry_close(conn: Connection, cfg: Config,
-                          instr: str, otype: str, strike: float, expiry) -> Optional[float]:
-    row = run_sql(conn, sql_best_expiry_close(cfg),
-                  instr=instr, otype=otype, strike=strike, expiry=expiry).fetchone()
-    if row and row[0] is not None:
-        return row[0]
-    row = run_sql(conn, sql_best_expiry_fallback(cfg),
-                  instr=instr, otype=otype, strike=strike, expiry=expiry).fetchone()
-    return None if row is None else row[0]
-
-
+# ---------------------------------------------------------------------
+# BUILD EOD POS (WITH MTM)
+# ---------------------------------------------------------------------
 def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int:
-    """
-    Per-ticket EOD snapshot.
-
-    For each (position_key_trade, day):
-      - Determine eod_price:
-          * from fetched_eod_prices
-          * fallback: previous implied price (prev_mv/prev_qty)
-      - mv_eod = eod_price * eod_net_qty  (if price known)
-      - unrealized_pnl = (eod_price - avg_cost_fifo) * eod_net_qty
-      - prev_unrealized_pnl from latest prior eod_positions row
-    Returns:
-      count of tickets where primary Upstox mark was missing (even if fallback used).
-    """
     missing_marks = 0
 
     fifo_rows = run_sql(conn, f"""
@@ -556,7 +600,6 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
     for r in fifo_rows:
         pk = r["position_key_trade"]
 
-        # Previous snapshot (if any)
         prev = run_sql(conn, f"""
             select eod_net_qty, mv_eod, unrealized_pnl
             from "{cfg.rpt_schema}"."eod_positions"
@@ -570,11 +613,10 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
         """, pk=pk, day=day).fetchone()
 
         prev_qty = float(prev[0]) if prev and prev[0] is not None else None
-        prev_mv = float(prev[1]) if prev and prev[1] is not None else None
+        prev_mv  = float(prev[1]) if prev and prev[1] is not None else None
         prev_unreal = float(prev[2]) if prev and prev[2] is not None else 0.0
         carry_in = (prev_qty is not None and prev_qty != 0.0)
 
-        # Primary mark from Upstox / fetched_eod_prices
         eod_price = get_best_mark(
             conn, cfg,
             day,
@@ -584,36 +626,21 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
             r["expiry_date"]
         )
 
-        used_fallback = False
-
         if eod_price is None:
-            # Track missing primary marks
             missing_marks += 1
-
-            # Fallback: previous implied price if we had a position and mv
-            prev_price = None
             if prev_qty is not None and prev_mv is not None and prev_qty != 0.0:
-                prev_price = prev_mv / prev_qty
+                eod_price = prev_mv / prev_qty
 
-            if prev_price is not None:
-                eod_price = prev_price
-                used_fallback = True
-
-        # Compute mv_eod
         qty = float(r["eod_net_qty"])
         avg_cost = float(r["avg_cost_fifo"]) if r["avg_cost_fifo"] is not None else None
 
         if eod_price is not None:
-            px = float(eod_price)
-            mv_eod = px * qty
+            mv_eod = eod_price * qty
         else:
-            # Last resort: no mark at all
             mv_eod = 0.0
 
-        # Compute unrealized P&L vs FIFO cost (your notebook formula)
         if eod_price is not None and avg_cost is not None and qty != 0.0:
-            px = float(eod_price)
-            unrealized_pnl = (px - avg_cost) * qty
+            unrealized_pnl = (eod_price - avg_cost) * qty
         else:
             unrealized_pnl = 0.0
 
@@ -643,20 +670,10 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
     return missing_marks
 
 
+# ---------------------------------------------------------------------
+# AUTO-CLOSE AFTER / AT EXPIRY
+# ---------------------------------------------------------------------
 def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> int:
-    """
-    Auto-close tickets still open ON or AFTER expiry using expiry mark.
-
-    For rows with:
-      trade_day = :day
-      eod_net_qty <> 0
-      trade_day >= expiry_date
-
-    Steps:
-      - Get expiry price (expiry day mark or last <= expiry).
-      - Realize remaining P&L vs avg_cost_fifo into realized_pnl_fifo_today.
-      - Set qty=0, mv_eod=0, avg_cost_fifo=NULL, unrealized_pnl=0.
-    """
     rows = run_sql(conn, f"""
         select
           position_key_trade,
@@ -683,17 +700,15 @@ def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> in
             r["expiry_date"]
         )
         if expiry_px is None:
-            # No expiry price; leave as-is, QA will show missing marks.
             continue
 
-        px = float(expiry_px)
         qty = float(r["eod_net_qty"])
         ac = float(r["avg_cost_fifo"] or 0.0)
 
         if qty > 0:
-            realized_bump = (px - ac) * qty
+            realized_bump = (expiry_px - ac) * qty
         else:
-            realized_bump = (ac - px) * abs(qty)
+            realized_bump = (ac - expiry_px) * abs(qty)
 
         run_sql(conn, f"""
             update "{cfg.rpt_schema}"."eod_positions"
@@ -705,42 +720,115 @@ def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> in
                    unrealized_pnl          = 0
              where trade_day = :day
                and position_key_trade = :pk
-        """, add_real=realized_bump, px=px, day=day, pk=r["position_key_trade"])
+        """, add_real=realized_bump, px=expiry_px, day=day, pk=r["position_key_trade"])
 
         applied += 1
 
     return applied
 
 
-def upsert_pnl_daily(conn: Connection, cfg: Config, day: date):
-    run_sql(conn, sql_upsert_pnl_daily(cfg), day=day)
+# ---------------------------------------------------------------------
+# ENQUEUE MISSING MARKS (AFTER MTM & AUTOCLOSE)
+# ---------------------------------------------------------------------
+def sql_enqueue_eod_marks(cfg: Config) -> str:
+    return f"""
+insert into "{cfg.rpt_schema}"."fetched_eod_prices" (
+    date,
+    instrument_name,
+    option_type,
+    strike,
+    expiry_date,
+    price,
+    retrieved_at
+)
+select distinct
+    :day                  as date,
+    e.instrument_name::text,
+    e.option_type::text,
+    e.strike::numeric,
+    e.expiry_date::date,
+    null::numeric         as price,
+    now()                 as retrieved_at
+from "{cfg.rpt_schema}"."eod_positions" e
+where e.trade_day = :day
+  and e.eod_net_qty <> 0
+  and e.expiry_date >= :day
+  and not exists (
+      select 1
+      from "{cfg.rpt_schema}"."fetched_eod_prices" p
+      where p.date            = :day
+        and p.instrument_name = e.instrument_name
+        and p.option_type     = e.option_type
+        and p.strike          = e.strike
+        and p.expiry_date     = e.expiry_date
+  );
+"""
 
 
-# -------------------------
-# Driver
-# -------------------------
+def enqueue_eod_marks(conn: Connection, cfg: Config, day: date) -> int:
+    res = run_sql(conn, sql_enqueue_eod_marks(cfg), day=day)
+    return res.rowcount or 0
+
+
+# ---------------------------------------------------------------------
+# QA: unparsable trade_date
+# ---------------------------------------------------------------------
+def sql_count_unparsable_trade_date_total(cfg: Config) -> str:
+    return f"""
+select count(*)::bigint
+from "{cfg.src_schema}"."{cfg.src_table}" t
+where to_date(t.trade_date::text, 'YYYY-MM-DD') is null;
+"""
+
+
+def sql_count_unparsable_trade_date_in_window(cfg: Config) -> str:
+    return f"""
+select count(*)::bigint
+from "{cfg.src_schema}"."{cfg.src_table}" t
+where to_date(t.trade_date::text, 'YYYY-MM-DD') is null
+  and t.trade_date::text >= :d_from_text
+  and t.trade_date::text <= :d_to_text;
+"""
+
+
+def count_unparsable_trade_dates(conn: Connection, cfg: Config, qa: QAStats):
+    qa.unparsable_trade_date_total = run_sql(
+        conn, sql_count_unparsable_trade_date_total(cfg)
+    ).scalar_one()
+    qa.unparsable_trade_date_in_window = run_sql(
+        conn,
+        sql_count_unparsable_trade_date_in_window(cfg),
+        d_from_text=cfg.start_date.isoformat(),
+        d_to_text=cfg.end_date.isoformat()
+    ).scalar_one()
+
+
+# ---------------------------------------------------------------------
+# DRIVER
+# ---------------------------------------------------------------------
 def run_pipeline(cfg: Config):
     qa = QAStats()
 
     with get_conn(cfg.db_url) as conn:
-        # 0) Ensure FIFO working table exists
+        # 0) Ensure working table exists
         run_sql(conn, sql_create_fifo_work(cfg))
 
-        # 1) QA: unparsable trade_date
+        # 1) QA
         count_unparsable_trade_dates(conn, cfg, qa)
 
-        # 2) FIFO for all tickets across the window
+        # 2) Build FIFO from trades
         rows = run_sql(conn, sql_select_trades(cfg),
                        d_from=cfg.start_date,
                        d_to=cfg.end_date).mappings().all()
-
         for _, group in groupby(rows, key=lambda r: r["position_key_trade"]):
             process_bucket(conn, cfg, group)
 
-        # 3) Per-day: enqueue marks → build EOD → autoclose → pnl_daily
-        cur = cfg.start_date
-        while cur <= cfg.end_date:
-            enqueue_eod_marks(conn, cfg, cur)
+        # 3) Trading days from calendar
+        trading_days = get_trading_days(conn, cfg)
+
+        # 4) Per-trading-day pipeline
+        for cur in trading_days:
+            ensure_fifo_carry_forward(conn, cfg, cur)
 
             missing = build_eod_positions_for_day(conn, cfg, cur)
             qa.missing_marks_by_day[cur] += missing
@@ -751,9 +839,10 @@ def run_pipeline(cfg: Config):
             qa.autoclose_total += closed
 
             upsert_pnl_daily(conn, cfg, cur)
-            cur += timedelta(days=1)
 
-    # --------- QA SUMMARY ----------
+            enqueue_eod_marks(conn, cfg, cur)
+
+    # QA summary
     print("\n====== QA SUMMARY ======")
     print(f"Date range                 : {cfg.start_date} .. {cfg.end_date}")
     print(f"Unparsable trade_date rows : total={qa.unparsable_trade_date_total} | in_window={qa.unparsable_trade_date_in_window}")
