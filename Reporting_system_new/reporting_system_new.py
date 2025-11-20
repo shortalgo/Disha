@@ -7,26 +7,20 @@ Source: core.trades
 
 Targets (schema: reports):
   - fifo_inventory_today  : ticket-scoped FIFO state per trade_day
-  - fetched_eod_prices    : EOD marks per (date, instrument, type, strike, expiry)
   - eod_positions         : ticket-scoped EOD snapshot, PK (trade_day, position_key_trade)
   - pnl_daily             : daily P&L aggregated from eod_positions
 
 Implements:
 - Ticket-scoped FIFO (partition includes trade_number via position_key_trade).
-- EOD marking using fetched_eod_prices (latest retrieved_at).
+- EOD marking using core.option_eod_prices_all (latest retrieved_at).
 - Auto-close AT / AFTER expiry-day mark (trade_day >= expiry_date) so P&L is realized on expiry.
 - Daily aggregation into reports.pnl_daily.
 - No fees.
 - QA summary of missing marks and auto-closes.
-- Enqueue of open positions into reports.fetched_eod_prices as NULL-price rows.
 - Missing mark handling:
-    * Primary: Upstox EOD marks in fetched_eod_prices.
+    * Primary: core.option_eod_prices_all (Upstox marks etc.).
     * Fallback: previous day's implied price (prev_mv / prev_qty) when available.
-    * As a last resort, mv_eod=0 (flagged via QA).
-- Correct unrealized P&L:
-    * unrealized_pnl (per ticket) = (eod_price - avg_cost_fifo) * eod_net_qty
-    * prev_unrealized_pnl from previous eod_positions row for that ticket
-    * pnl_daily.unrealized_change = sum(unrealized_pnl - prev_unrealized_pnl)
+    * If still missing: mv_eod=0, unrealized_pnl=0, and logged in QA as missing mark.
 """
 
 import argparse
@@ -88,6 +82,8 @@ class QAStats:
         self.autoclose_total = 0
         self.unparsable_trade_date_total = 0
         self.unparsable_trade_date_in_window = 0
+        # Detailed list of missing marks (no mark and no fallback)
+        self.missing_mark_details: List[Dict] = []
 
 
 # ---------------------------------------------------------------------
@@ -272,46 +268,55 @@ on conflict (position_key_trade, trade_day) do update set
 
 
 # ---------------------------------------------------------------------
-# PRICE LOOKUPS
+# PRICE LOOKUPS (core.option_eod_prices_all)
 # ---------------------------------------------------------------------
 def sql_best_mark(cfg: Config) -> str:
-    return f"""
+    """
+    EOD mark for a given trade_day from core.option_eod_prices_all.
+    """
+    return """
 select price
-from "{cfg.rpt_schema}"."fetched_eod_prices"
-where date = :day
+from core.option_eod_prices_all
+where trade_date      = :day
   and instrument_name = :instr
-  and option_type = :otype
-  and strike = :strike
-  and expiry_date = :expiry
+  and option_type     = :otype
+  and strike          = :strike
+  and expiry_date     = :expiry
 order by retrieved_at desc
 limit 1;
 """
 
 
 def sql_best_expiry_close(cfg: Config) -> str:
-    return f"""
+    """
+    Expiry-close mark (trade_date = expiry_date).
+    """
+    return """
 select price
-from "{cfg.rpt_schema}"."fetched_eod_prices"
+from core.option_eod_prices_all
 where instrument_name = :instr
-  and option_type = :otype
-  and strike = :strike
-  and expiry_date = :expiry
-  and date = :expiry
+  and option_type     = :otype
+  and strike          = :strike
+  and expiry_date     = :expiry
+  and trade_date      = :expiry
 order by retrieved_at desc
 limit 1;
 """
 
 
 def sql_best_expiry_fallback(cfg: Config) -> str:
-    return f"""
+    """
+    Fallback: latest mark with trade_date <= expiry_date.
+    """
+    return """
 select price
-from "{cfg.rpt_schema}"."fetched_eod_prices"
+from core.option_eod_prices_all
 where instrument_name = :instr
-  and option_type = :otype
-  and strike = :strike
-  and expiry_date = :expiry
-  and date <= :expiry
-order by date desc, retrieved_at desc
+  and option_type     = :otype
+  and strike          = :strike
+  and expiry_date     = :expiry
+  and trade_date     <= :expiry
+order by trade_date desc, retrieved_at desc
 limit 1;
 """
 
@@ -587,7 +592,11 @@ def ensure_fifo_carry_forward(conn: Connection, cfg: Config, day: date):
 # ---------------------------------------------------------------------
 # BUILD EOD POS (WITH MTM)
 # ---------------------------------------------------------------------
-def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int:
+def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date, qa: QAStats) -> int:
+    """
+    Build eod_positions rows for a given trade_day.
+    Returns the count of positions where NO mark and NO fallback were available.
+    """
     missing_marks = 0
 
     fifo_rows = run_sql(conn, f"""
@@ -617,6 +626,7 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
         prev_unreal = float(prev[2]) if prev and prev[2] is not None else 0.0
         carry_in = (prev_qty is not None and prev_qty != 0.0)
 
+        # Try to get EOD mark from core.option_eod_prices_all
         eod_price = get_best_mark(
             conn, cfg,
             day,
@@ -627,9 +637,19 @@ def build_eod_positions_for_day(conn: Connection, cfg: Config, day: date) -> int
         )
 
         if eod_price is None:
-            missing_marks += 1
+            # Try fallback from previous mv_eod if any
             if prev_qty is not None and prev_mv is not None and prev_qty != 0.0:
                 eod_price = prev_mv / prev_qty
+            else:
+                # Truly missing mark for this day and contract
+                missing_marks += 1
+                qa.missing_mark_details.append({
+                    "trade_day": day,
+                    "instrument_name": r["instrument_name"],
+                    "option_type": r["option_type"],
+                    "strike": float(r["strike"]),
+                    "expiry_date": r["expiry_date"],
+                })
 
         qty = float(r["eod_net_qty"])
         avg_cost = float(r["avg_cost_fifo"]) if r["avg_cost_fifo"] is not None else None
@@ -700,6 +720,7 @@ def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> in
             r["expiry_date"]
         )
         if expiry_px is None:
+            # No expiry-day mark; leave as is (position stays open in this snapshot)
             continue
 
         qty = float(r["eod_net_qty"])
@@ -725,49 +746,6 @@ def apply_autoclose_after_expiry(conn: Connection, cfg: Config, day: date) -> in
         applied += 1
 
     return applied
-
-
-# ---------------------------------------------------------------------
-# ENQUEUE MISSING MARKS (AFTER MTM & AUTOCLOSE)
-# ---------------------------------------------------------------------
-def sql_enqueue_eod_marks(cfg: Config) -> str:
-    return f"""
-insert into "{cfg.rpt_schema}"."fetched_eod_prices" (
-    date,
-    instrument_name,
-    option_type,
-    strike,
-    expiry_date,
-    price,
-    retrieved_at
-)
-select distinct
-    :day                  as date,
-    e.instrument_name::text,
-    e.option_type::text,
-    e.strike::numeric,
-    e.expiry_date::date,
-    null::numeric         as price,
-    now()                 as retrieved_at
-from "{cfg.rpt_schema}"."eod_positions" e
-where e.trade_day = :day
-  and e.eod_net_qty <> 0
-  and e.expiry_date >= :day
-  and not exists (
-      select 1
-      from "{cfg.rpt_schema}"."fetched_eod_prices" p
-      where p.date            = :day
-        and p.instrument_name = e.instrument_name
-        and p.option_type     = e.option_type
-        and p.strike          = e.strike
-        and p.expiry_date     = e.expiry_date
-  );
-"""
-
-
-def enqueue_eod_marks(conn: Connection, cfg: Config, day: date) -> int:
-    res = run_sql(conn, sql_enqueue_eod_marks(cfg), day=day)
-    return res.rowcount or 0
 
 
 # ---------------------------------------------------------------------
@@ -830,7 +808,7 @@ def run_pipeline(cfg: Config):
         for cur in trading_days:
             ensure_fifo_carry_forward(conn, cfg, cur)
 
-            missing = build_eod_positions_for_day(conn, cfg, cur)
+            missing = build_eod_positions_for_day(conn, cfg, cur, qa)
             qa.missing_marks_by_day[cur] += missing
             qa.missing_marks_total += missing
 
@@ -839,8 +817,6 @@ def run_pipeline(cfg: Config):
             qa.autoclose_total += closed
 
             upsert_pnl_daily(conn, cfg, cur)
-
-            enqueue_eod_marks(conn, cfg, cur)
 
     # QA summary
     print("\n====== QA SUMMARY ======")
@@ -854,6 +830,15 @@ def run_pipeline(cfg: Config):
         print("\nTop days with missing EOD marks (day → count):")
         for d, c in top_mm:
             print(f"  {d} → {c}")
+
+        # Detailed sample of missing marks
+        print("\nSample missing marks (up to 20):")
+        for rec in qa.missing_mark_details[:20]:
+            print(
+                f"  {rec['trade_day']} "
+                f"{rec['instrument_name']} {rec['option_type']} "
+                f"K={rec['strike']} exp={rec['expiry_date']}"
+            )
 
     if qa.autoclose_total > 0:
         top_ac = sorted(qa.autoclose_by_day.items(), key=lambda kv: kv[1], reverse=True)[:10]
