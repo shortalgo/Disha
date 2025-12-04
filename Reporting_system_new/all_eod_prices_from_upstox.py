@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import sys
+import argparse
 import getpass
 from urllib.parse import quote_plus
+from datetime import date
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -13,11 +15,19 @@ from upstox_client.rest import ApiException
 # =========================================
 # DB CONFIG
 # =========================================
+# Prod DB
 DB_USER = "postgres"
 DB_PASSWORD = "New@1234"   # TODO: move to env var
 DB_HOST = "192.168.18.23"
 DB_PORT = 5432
 DB_NAME = "postgres"
+
+# Test database (commented)
+# DB_USER = "postgres"
+# DB_PASSWORD = "New@121"   # TODO: move to env var
+# DB_HOST = "localhost"
+# DB_PORT = 5432
+# DB_NAME = "postgres"
 
 
 # =========================================
@@ -38,7 +48,8 @@ def get_engine():
 # =========================================
 def normalize_underlying(raw: str | None) -> str | None:
     """
-    Normalize underlying names so they match reports.fetched_eod_prices.instrument_name.
+    Normalize underlying names so they match instrument_name in our EOD table.
+    Only NIFTY, SENSEX, BANKNIFTY, FINNIFTY, MIDCPNIFTY are of interest.
     """
     if raw is None:
         return None
@@ -53,8 +64,12 @@ def normalize_underlying(raw: str | None) -> str | None:
         return "SENSEX"
     if "FINNIFTY" in s:
         return "FINNIFTY"
+    # MIDCAP NIFTY index – handle correct + common typo
+    if s in ("MIDCPNIFTY", "MIDCPNICTY"):
+        return "MIDCPNIFTY"
 
-    return s or None
+    # anything else is irrelevant for this script
+    return None
 
 
 def parse_opt_type_from_ts(ts: str) -> str | None:
@@ -93,9 +108,11 @@ def parse_expiry(expiry_val):
 # =========================================
 def load_instruments():
     """
-    Build lookup:
-        (underlying, opt_type, strike, expiry_str) -> instrument_key
-    for F&O options.
+    Load all F&O options from Upstox instrument masters and normalize.
+
+    Returns a DataFrame with columns:
+        instrument_key, underlying, opt_type, strike, expiry_str
+    but **filtered only to NIFTY, SENSEX, BANKNIFTY, FINNIFTY, MIDCPNIFTY** options.
     """
     print("[INFO] Loading Upstox instrument masters...")
     urls = [
@@ -119,7 +136,7 @@ def load_instruments():
     inst = pd.concat(frames, ignore_index=True)
     print("[DEBUG] Instrument master columns:", list(inst.columns))
 
-    # Sanity
+    # Sanity check
     required = ["segment", "instrument_type", "instrument_key",
                 "trading_symbol", "strike_price", "expiry"]
     for col in required:
@@ -177,7 +194,7 @@ def load_instruments():
 
     inst_opt["underlying"] = base.apply(normalize_underlying)
 
-    # Final validity
+    # Final validity (only our indices will survive normalize_underlying)
     mask_valid = (
         inst_opt["opt_type"].isin(["CE", "PE"])
         & inst_opt["strike"].notna()
@@ -186,44 +203,31 @@ def load_instruments():
     )
     inst_opt_valid = inst_opt[mask_valid].copy()
 
-    print(f"[INFO] Valid option rows after normalization: {len(inst_opt_valid)}")
+    print(f"[INFO] Valid option rows after normalization (before index filter): {len(inst_opt_valid)}")
 
     if inst_opt_valid.empty:
         print("[ERROR] No valid option rows after normalization.")
         sys.exit(1)
 
-    # Build MultiIndex lookup
+    # Now explicitly filter to the 5 indices
+    wanted = {"NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+    inst_opt_valid = inst_opt_valid[inst_opt_valid["underlying"].isin(wanted)].copy()
+
+    print(f"[INFO] Rows after filtering to {wanted}: {len(inst_opt_valid)}")
+
+    if inst_opt_valid.empty:
+        print("[ERROR] No NIFTY/SENSEX/BANKNIFTY/FINNIFTY/MIDCPNIFTY options found after filtering.")
+        sys.exit(1)
+
+    # Return a clean DF, one row per instrument_key/contract
     inst_opt_valid = (
         inst_opt_valid[["instrument_key", "underlying", "opt_type", "strike", "expiry_str"]]
-        .drop_duplicates(
-            subset=["underlying", "opt_type", "strike", "expiry_str", "instrument_key"]
-        )
-        .set_index(["underlying", "opt_type", "strike", "expiry_str"])
-        .sort_index()
+        .drop_duplicates(subset=["instrument_key", "underlying", "opt_type", "strike", "expiry_str"])
+        .reset_index(drop=True)
     )
 
-    print("[OK] Instrument lookup table ready.")
+    print("[OK] Instrument option table ready (5 indices).")
     return inst_opt_valid
-
-
-# =========================================
-# LOAD ROWS NEEDING PRICES
-# =========================================
-def load_missing_eod(engine):
-    q = """
-        SELECT id,
-               date,
-               instrument_name,
-               option_type,
-               strike,
-               expiry_date
-        FROM reports.fetched_eod_prices
-        WHERE price IS NULL
-        ORDER BY date, instrument_name, option_type, strike, expiry_date, id
-    """
-    df = pd.read_sql_query(q, engine)
-    print(f"[INFO] Found {len(df)} rows needing prices.")
-    return df
 
 
 # =========================================
@@ -256,8 +260,6 @@ def fetch_ltp_batch(api_instance, instrument_keys):
           },
           ...
         }
-
-    We key by instrument_token / instrument_key from payload so it matches our mapping.
     """
     if not instrument_keys:
         return {}
@@ -287,107 +289,108 @@ def fetch_ltp_batch(api_instance, instrument_keys):
 
 
 # =========================================
-# MAIN: MAP fetched_eod_prices -> Upstox LTP
+# MAIN: FETCH LTPs FOR 5 INDICES AND SAVE TO EOD TABLE
 # =========================================
 def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch EOD LTP for NIFTY/SENSEX/BANKNIFTY/FINNIFTY/MIDCPNIFTY options and store in core.option_eod_prices_all"
+    )
+    parser.add_argument(
+        "--date",
+        help="Trade date (YYYY-MM-DD) for which these marks are considered EOD. Default = today.",
+    )
+    args = parser.parse_args()
+
+    if args.date:
+        try:
+            trade_date = date.fromisoformat(args.date)
+        except ValueError:
+            print("[FATAL] Invalid --date; expected YYYY-MM-DD")
+            sys.exit(1)
+    else:
+        trade_date = date.today()
+
+    print(f"[INFO] Using trade_date = {trade_date}")
+
     engine = get_engine()
-    inst_lookup = load_instruments()
-
-    missing = load_missing_eod(engine)
-    if missing.empty:
-        print("[OK] Nothing to fill. Exiting.")
-        return
-
+    inst_df = load_instruments()  # already filtered to 5 indices
     api = get_upstox_client()
 
-    mapped_rows = []
-    misses = 0
-
-    # Map DB rows -> Upstox instrument_key via (underlying, opt_type, strike, expiry)
-    for _, r in missing.iterrows():
-        underlying = normalize_underlying(str(r["instrument_name"]).strip())
-        opt_type = str(r["option_type"]).upper().strip()
-        strike = float(r["strike"])
-        expiry_str = pd.to_datetime(r["expiry_date"]).strftime("%Y-%m-%d")
-
-        if not underlying:
-            print(f"[MISS] Invalid underlying for id={r['id']}: {r['instrument_name']}")
-            misses += 1
-            continue
-
-        key = (underlying, opt_type, strike, expiry_str)
-
-        try:
-            matches = inst_lookup.loc[[key]]
-            instr_key = matches["instrument_key"].iloc[0]
-            mapped_rows.append((r["id"], instr_key))
-        except KeyError:
-            print(f"[MISS] No instrument match for {key}")
-            misses += 1
-
-    print(f"[INFO] Successfully mapped {len(mapped_rows)} of {len(missing)} rows to instrument_key.")
-    if misses:
-        print(f"[INFO] {misses} rows could not be mapped and will be skipped.")
-
-    if not mapped_rows:
-        print("[WARN] No instruments could be mapped. Check naming/strikes/expiries.")
-        return
-
-    # Unique instrument_keys for LTP
-    id_to_instr = {row_id: ikey for (row_id, ikey) in mapped_rows}
-    unique_instr_keys = sorted(set(id_to_instr.values()))
-    print(f"[INFO] Fetching LTP for {len(unique_instr_keys)} unique instrument keys...")
+    # Build LTP map for ALL unique instrument_keys (only for the 5 indices universe)
+    unique_instr_keys = sorted(inst_df["instrument_key"].dropna().unique())
+    print(f"[INFO] Fetching LTP for {len(unique_instr_keys)} unique option instrument keys...")
 
     batch_size = 100
     ltp_map = {}
     for i in range(0, len(unique_instr_keys), batch_size):
-        batch = unique_instr_keys[i : i + batch_size]
+        batch = unique_instr_keys[i: i + batch_size]
+        print(f"[INFO] LTP batch {i}..{i + len(batch) - 1}")
         res = fetch_ltp_batch(api, batch)
         ltp_map.update(res)
 
     print(f"[INFO] Retrieved LTP for {len(ltp_map)} instruments.")
 
-    # Build update list using instrument_key-based map
-    updates = []
-    missing_ltp = 0
-    for row_id, ikey in id_to_instr.items():
-        px = ltp_map.get(ikey)
-        if px is not None:
-            updates.append((row_id, px))
-        else:
-            missing_ltp += 1
+    # Attach prices to DF
+    inst_df["price"] = inst_df["instrument_key"].map(ltp_map)
+    df_has_price = inst_df.dropna(subset=["price"]).copy()
 
-    print(f"[INFO] Updating {len(updates)} fetched_eod_prices rows with LTP.")
-    if missing_ltp:
-        print(f"[INFO] {missing_ltp} mapped instruments had no LTP in response (skipped).")
+    print(f"[INFO] {len(df_has_price)} option rows have a valid LTP and will be inserted/updated.")
 
-    if not updates:
-        print("[WARN] No prices resolved. Nothing to update.")
+    if df_has_price.empty:
+        print("[WARN] No prices resolved. Nothing to store.")
         return
 
-    # Apply updates in one transaction
-    with engine.begin() as conn:
-        for row_id, px in updates:
-            conn.execute(
-                text(
-                    """
-                    UPDATE reports.fetched_eod_prices
-                    SET price = :px,
-                        retrieved_at = NOW()
-                    WHERE id = :id
-                    """
-                ),
-                {"px": px, "id": row_id},
-            )
+    # Insert/Upsert into core.option_eod_prices_all
+    insert_sql = text("""
+        INSERT INTO core.option_eod_prices_all (
+            trade_date,
+            instrument_name,
+            option_type,
+            strike,
+            expiry_date,
+            price,
+            source,
+            instrument_key,
+            retrieved_at
+        )
+        VALUES (
+            :trade_date,
+            :instrument_name,
+            :option_type,
+            :strike,
+            :expiry_date,
+            :price,
+            'upstox_ltp',
+            :instrument_key,
+            NOW()
+        )
+        ON CONFLICT (trade_date, instrument_name, option_type, strike, expiry_date)
+        DO UPDATE SET
+            price         = EXCLUDED.price,
+            source        = EXCLUDED.source,
+            instrument_key = EXCLUDED.instrument_key,
+            retrieved_at  = EXCLUDED.retrieved_at;
+    """)
 
-    print("[OK] Updates committed.")
+    with engine.begin() as conn:
+        rows = 0
+        for _, r in df_has_price.iterrows():
+            conn.execute(
+                insert_sql,
+                {
+                    "trade_date": trade_date,
+                    "instrument_name": r["underlying"],  # NIFTY/SENSEX/BANKNIFTY/FINNIFTY/MIDCPNIFTY
+                    "option_type": r["opt_type"],
+                    "strike": float(r["strike"]),
+                    "expiry_date": r["expiry_str"],
+                    "price": float(r["price"]),
+                    "instrument_key": r["instrument_key"],
+                },
+            )
+            rows += 1
+
+    print(f"[OK] Inserted/updated {rows} rows into core.option_eod_prices_all for {trade_date}.")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-#eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI0TEM5VksiLCJqdGkiOiI2OTBjYWUyZDk4MTRmYjM5NTdkNGY1ZTciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2MjQzODcwMSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzYyNDY2NDAwfQ.AOQA-TrpmaOk7dlvHoEpGxsPwJpk5tAhfybjArk4iUg
