@@ -1,27 +1,24 @@
--- core.trades_with_eod source
+-- core.v_trades_named source
 
-CREATE OR REPLACE VIEW core.trades_with_eod
-AS SELECT t.unique_id,
-    t.upload_date,
-    t.modified_date,
-    t.instrument_name,
-    t.trade_number,
-    t.trade_date,
+CREATE OR REPLACE VIEW core.v_trades_named
+AS SELECT t.trade_date,
     t.trade_time,
-    t.trade_price,
-    t.strike,
-    t.type,
-    t.expiry_date,
-    t.entry_exit_error,
-    t.qty,
-    t.reason_exit,
+    u.name AS user_name,
+    s.strategy_name,
+    sv.variant_name AS strategy_variant_name,
+    sv.tradetron_name,
     t.account_id,
     t.strategy_id,
+    t.strategy_variant_id,
     t.user_id,
-    t.theoretical_price,
-    t.theoretical_time,
-    t.eod_price_id,
-    COALESCE(t.eod_price_id, ep.id) AS resolved_eod_price_id,
-    ep.price AS resolved_eod_price
+    t.instrument_name,
+    upper(t.type::text) AS option_type,
+    t.strike::numeric AS strike,
+    t.expiry_date,
+    t.trade_number::bigint AS trade_number,
+    t.qty::numeric AS qty,
+    t.trade_price::numeric AS trade_price
    FROM core.trades t
-     LEFT JOIN core.eod_prices ep ON ep.date = t.trade_date AND ep.expiry_date = t.expiry_date AND ep.option_type = t.type AND ep.strike = t.strike;
+     LEFT JOIN core.users u ON u.id_no = t.user_id
+     LEFT JOIN core.strategies s ON s.id = t.strategy_id
+     LEFT JOIN core.strategy_variants sv ON sv.id = t.strategy_variant_id;
