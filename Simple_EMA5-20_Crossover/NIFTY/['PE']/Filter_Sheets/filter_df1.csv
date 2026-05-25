@@ -1,0 +1,7 @@
+Strategy,Parameters,Status
+NIFTY_candle_5T_strike_OTM_side_PE_entry_09:25_exit_15:20_2024-01-01_2024-01-31,"['5T', -1, 'PE', '09:25', '15:20']",0
+NIFTY_candle_5T_strike_ATM_side_PE_entry_09:25_exit_15:20_2024-01-01_2024-01-31,"['5T', 0, 'PE', '09:25', '15:20']",0
+NIFTY_candle_5T_strike_ITM_side_PE_entry_09:25_exit_15:20_2024-01-01_2024-01-31,"['5T', 1, 'PE', '09:25', '15:20']",0
+NIFTY_candle_5T_strike_ITM_side_PE_entry_09:25_exit_15:20_2024-01-01_2024-12-31,"['5T', 1, 'PE', '09:25', '15:20']",0
+NIFTY_candle_5T_strike_ATM_side_PE_entry_09:25_exit_15:20_2024-01-01_2024-12-31,"['5T', 0, 'PE', '09:25', '15:20']",0
+NIFTY_candle_5T_strike_OTM_side_PE_entry_09:25_exit_15:20_2024-01-01_2024-12-31,"['5T', -1, 'PE', '09:25', '15:20']",0
